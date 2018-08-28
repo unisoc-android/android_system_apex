@@ -26,10 +26,13 @@ python_binary_host {
         },
     },
     required: [
-        "mke2fs",
-        "e2fsdroid",
-        "resize2fs",
         "aapt2",
+        "e2fsdroid",
+        "merge_zips",
+        "mke2fs",
+        "resize2fs",
+        "sefcontext_compile",
+        "soong_zip",
         "zipalign",
     ],
 }
