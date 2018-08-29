@@ -34,6 +34,8 @@ class ApexFile {
   int32_t GetImageOffset() const { return image_offset_; }
   size_t GetImageSize() const { return image_size_; }
 
+  std::string GetManifest() const { return manifest_; }
+
  private:
   ApexFile(const std::string& apex_filename)
       : apex_filename_(apex_filename), handle_(nullptr){};
@@ -42,6 +44,7 @@ class ApexFile {
   const std::string apex_filename_;
   int32_t image_offset_;
   size_t image_size_;
+  std::string manifest_;
   ZipArchiveHandle handle_;
 };
 

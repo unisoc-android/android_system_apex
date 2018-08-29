@@ -14,16 +14,32 @@
  * limitations under the License.
  */
 
-#include "apexservice.h"
+#ifndef ANDROID_APEXD_APEX_MANIFEST_H_
+#define ANDROID_APEXD_APEX_MANIFEST_H_
+
+#include <string>
 
 namespace android {
 namespace apex {
 
-::android::binder::Status ApexService::ping(bool* aidl_return) {
-  *aidl_return = true;
+// Parses an APEX manifest on construction and exposes its fields.
+class ApexManifest {
+ public:
+  static std::unique_ptr<ApexManifest> Open(const std::string& apex_manifest);
 
-  return binder::Status::ok();
-}
+  std::string GetName() const { return name_; }
+  uint64_t GetVersion() const { return version_; }
 
-};  // namespace apex
-};  // namespace android
+ private:
+  ApexManifest(const std::string& apex_manifest) : manifest_(apex_manifest){};
+  int OpenInternal();
+
+  std::string manifest_;
+  std::string name_;
+  uint64_t version_;
+};
+
+}  // namespace apex
+}  // namespace android
+
+#endif  // ANDROID_APEXD_APEX_MANIFEST_H_
