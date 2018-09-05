@@ -30,7 +30,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import traceback
 
 def ParseArgs(argv):
   parser = argparse.ArgumentParser(description='Create an APEX file')
@@ -72,24 +71,25 @@ def RunCommand(cmd, verbose=False, env=None):
 
 def GetDirSize(dir_name):
   size = 0
-  for dirpath, dirnames, filenames in os.walk(dir_name):
+  for dirpath, _, filenames in os.walk(dir_name):
     for f in filenames:
       size += os.path.getsize(os.path.join(dirpath, f))
   return size
+
 
 def RoundUp(size, unit):
   assert unit & (unit - 1) == 0
   return (size + unit - 1) & (~(unit - 1))
 
 
-def PrepareAndroidManifest(packagename):
+def PrepareAndroidManifest(package, version):
   template = """\
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-  package="{packagename}">
+  package="{package}" versionCode="{version}">
 </manifest>
 """
-  return template.format(packagename=packagename)
+  return template.format(package=package, version=version)
 
 
 def ValidateArgs(args):
@@ -134,6 +134,7 @@ def CreateApex(args, work_dir):
     print("Invalid manifest: 'name' does not exist")
     return False
   package_name = manifest['name']
+  version_number = manifest['version']
 
   # create an empty ext4 image that is sufficiently big
   # Sufficiently big = twice the size of the input directory
@@ -234,7 +235,7 @@ def CreateApex(args, work_dir):
   if args.verbose:
     print('Creating AndroidManifest ' + android_manifest_file)
   with open(android_manifest_file, 'w+') as f:
-    f.write(PrepareAndroidManifest(package_name))
+    f.write(PrepareAndroidManifest(package_name, version_number))
 
   # copy manifest to the content dir so that it is also accessible
   # without mounting the image
@@ -283,7 +284,7 @@ class TempDirectory(object):
     self.name = tempfile.mkdtemp()
     return self.name
 
-  def __exit__(self, exc_type, exc_value, traceback):
+  def __exit__(self, *unused):
     shutil.rmtree(self.name)
 
 
