@@ -53,7 +53,9 @@ var (
 			`--file_contexts ${file_contexts} ` +
 			`--canned_fs_config ${canned_fs_config} ` +
 			`--key ${key} ${image_dir} ${out} `,
-		CommandDeps: []string{"${apexer}"},
+		CommandDeps: []string{"${apexer}", "${avbtool}", "${e2fsdroid}", "${merge_zips}",
+			"${mke2fs}", "${resize2fs}", "${sefcontext_compile}",
+			"${soong_zip}", "${zipalign}", "${aapt2}"},
 		Description: "APEX ${image_dir} => ${out}",
 	}, "tool_path", "image_dir", "copy_commands", "manifest", "file_contexts", "canned_fs_config", "key")
 )
@@ -69,11 +71,22 @@ var (
 	sharedLibTag  = dependencyTag{name: "sharedLib"}
 	executableTag = dependencyTag{name: "executable"}
 	javaLibTag    = dependencyTag{name: "javaLib"}
+	prebuiltTag   = dependencyTag{name: "prebuilt"}
 )
 
 func init() {
 	pctx.Import("android/soong/common")
 	pctx.HostBinToolVariable("apexer", "apexer")
+	pctx.HostBinToolVariable("aapt2", "aapt2")
+	pctx.HostBinToolVariable("avbtool", "avbtool")
+	pctx.HostBinToolVariable("e2fsdroid", "e2fsdroid")
+	pctx.HostBinToolVariable("merge_zips", "merge_zips")
+	pctx.HostBinToolVariable("mke2fs", "mke2fs")
+	pctx.HostBinToolVariable("resize2fs", "resize2fs")
+	pctx.HostBinToolVariable("sefcontext_compile", "sefcontext_compile")
+	pctx.HostBinToolVariable("soong_zip", "soong_zip")
+	pctx.HostBinToolVariable("zipalign", "zipalign")
+
 	android.RegisterModuleType("apex", apexBundleFactory)
 }
 
@@ -94,6 +107,9 @@ type apexBundleProperties struct {
 
 	// List of java libraries that are embedded inside this APEX bundle
 	Java_modules []string
+
+	// List of prebuilt files that are embedded inside this APEX bundle
+	Prebuilt_modules []string
 }
 
 type apexBundle struct {
@@ -134,6 +150,8 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 	}, executableTag, a.properties.Executable_modules...)
 
 	ctx.AddFarVariationDependencies([]blueprint.Variation{}, javaLibTag, a.properties.Java_modules...)
+
+	ctx.AddFarVariationDependencies([]blueprint.Variation{}, prebuiltTag, a.properties.Prebuilt_modules...)
 }
 
 func (a *apexBundle) GenerateAndroidBuildActions(ctx android.ModuleContext) {
@@ -183,6 +201,15 @@ func (a *apexBundle) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 					pathsInApex = append(pathsInApex, dir)
 				}
 				copyManifest[java.Srcs()[0]] = filepath.Join(dir, java.Srcs()[0].Base())
+			}
+		case prebuiltTag:
+			if prebuilt, ok := dep.(*android.PrebuiltEtc); ok {
+				dir := filepath.Join("etc", prebuilt.SubDir())
+				pathsInApex = append(pathsInApex, filepath.Join(dir, prebuilt.OutputFile().Base()))
+				if !android.InList(dir, pathsInApex) {
+					pathsInApex = append(pathsInApex, dir)
+				}
+				copyManifest[prebuilt.OutputFile()] = filepath.Join(dir, prebuilt.OutputFile().Base())
 			}
 		}
 	})

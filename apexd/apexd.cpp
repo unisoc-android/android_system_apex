@@ -70,7 +70,7 @@ namespace apex {
 
 static constexpr const char* kApexPackageDir = "/data/apex";
 static constexpr const char* kApexPackageSuffix = ".apex";
-static constexpr const char* kApexRoot = "/mnt/apex";
+static constexpr const char* kApexRoot = "/apex";
 static constexpr const char* kApexLoopIdPrefix = "apex:";
 
 // For now, we assume a single key in a known location
@@ -121,11 +121,18 @@ status_t createLoopDevice(const std::string& target, const int32_t imageOffset,
     return -errno;
   }
 
-  int use_dio = 1;
-  if (ioctl(device_fd.get(), LOOP_SET_DIRECT_IO, &use_dio) == -1) {
-    PLOG(WARNING) << "Failed to LOOP_SET_DIRECT_IO";
-    // TODO decide if we want to fail on this or not.
+  // Direct-IO requires the loop device to have the same block size as the
+  // underlying filesystem.
+  if (ioctl(device_fd.get(), LOOP_SET_BLOCK_SIZE, 4096) == -1) {
+    PLOG(WARNING) << "Failed to LOOP_SET_BLOCK_SIZE";
+  } else {
+    if (ioctl(device_fd.get(), LOOP_SET_DIRECT_IO, 1) == -1) {
+      PLOG(WARNING) << "Failed to LOOP_SET_DIRECT_IO";
+      // TODO Eventually we'll want to fail on this; right now we can't because
+      // not all devices have the necessary kernel patches.
+    }
   }
+
 
   return 0;
 }
@@ -583,11 +590,6 @@ void unmountAndDetachExistingImages() {
   destroyAllLoopDevices();
 }
 
-void setupApexRoot() {
-  LOG(INFO) << "Creating APEX mount point at " << kApexRoot;
-  mkdir(kApexRoot, 0755);
-}
-
 void scanPackagesDirAndMount() {
   LOG(INFO) << "Scanning " << kApexPackageDir << " looking for APEX packages.";
   auto d =
@@ -623,7 +625,6 @@ int main(int /*argc*/, char** /*argv*/) {
                                       apexService);
 
   android::apex::unmountAndDetachExistingImages();
-  android::apex::setupApexRoot();
   android::apex::scanPackagesDirAndMount();
 
   // Start threadpool, wait for IPC
