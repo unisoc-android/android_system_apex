@@ -14,34 +14,27 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_APEXD_APEX_MANIFEST_H_
-#define ANDROID_APEXD_APEX_MANIFEST_H_
+#ifndef ANDROID_APEXD_APEXD_H_
+#define ANDROID_APEXD_APEXD_H_
 
 #include <string>
 
-#include <status_or.h>
+#include <android-base/macros.h>
+
+#include "status_or.h"
 
 namespace android {
 namespace apex {
 
-// Parses an APEX manifest on construction and exposes its fields.
-class ApexManifest {
- public:
-  static StatusOr<std::unique_ptr<ApexManifest>> Open(const std::string& apex_manifest);
+static constexpr const char* kApexPackageDataDir = "/data/apex";
 
-  std::string GetName() const { return name_; }
-  uint64_t GetVersion() const { return version_; }
+void unmountAndDetachExistingImages();
 
- private:
-  ApexManifest(const std::string& apex_manifest) : manifest_(apex_manifest){};
-  int OpenInternal(std::string* error_msg);
+void scanPackagesDirAndMount(const char* apex_package_dir);
 
-  std::string manifest_;
-  std::string name_;
-  uint64_t version_;
-};
+StatusOr<bool> installPackage(const std::string& packageTmpPath) WARN_UNUSED;
 
 }  // namespace apex
 }  // namespace android
 
-#endif  // ANDROID_APEXD_APEX_MANIFEST_H_
+#endif  // ANDROID_APEXD_APEXD_H_
