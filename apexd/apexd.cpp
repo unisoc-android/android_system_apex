@@ -20,6 +20,7 @@
 
 #include "apex_file.h"
 #include "apex_manifest.h"
+#include "status_or.h"
 #include "string_log.h"
 
 #include <android-base/file.h>
@@ -69,31 +70,72 @@ static constexpr const char* kApexKeyProp = "apex.key";
 
 static constexpr int kVbMetaMaxSize = 64 * 1024;
 
-Status createLoopDevice(const std::string& target, const int32_t imageOffset,
-                        const size_t imageSize, std::string& out_device) {
+struct LoopbackDeviceUniqueFd {
+  unique_fd device_fd;
+  std::string name;
+
+  LoopbackDeviceUniqueFd() {}
+  LoopbackDeviceUniqueFd(unique_fd&& fd, const std::string& name)
+      : device_fd(std::move(fd)), name(name) {}
+
+  LoopbackDeviceUniqueFd(LoopbackDeviceUniqueFd&& fd) noexcept
+      : device_fd(std::move(fd.device_fd)), name(fd.name) {}
+  LoopbackDeviceUniqueFd& operator=(LoopbackDeviceUniqueFd&& other) noexcept {
+    MaybeCloseBad();
+    device_fd = std::move(other.device_fd);
+    name = std::move(other.name);
+    return *this;
+  }
+
+  ~LoopbackDeviceUniqueFd() {
+    MaybeCloseBad();
+  }
+
+  void MaybeCloseBad() {
+    if (device_fd.get() != -1) {
+      // Disassociate any files.
+      if (ioctl(device_fd.get(), LOOP_CLR_FD) == -1) {
+        PLOG(ERROR) << "Unable to clear fd for loopback device";
+      }
+    }
+  }
+
+  void CloseGood() {
+    device_fd.reset(-1);
+  }
+
+  int get() {
+    return device_fd.get();
+  }
+};
+
+StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
+                                                  const int32_t imageOffset,
+                                                  const size_t imageSize) {
+  using Failed = StatusOr<LoopbackDeviceUniqueFd>;
   unique_fd ctl_fd(open("/dev/loop-control", O_RDWR | O_CLOEXEC));
   if (ctl_fd.get() == -1) {
-    return Status::Fail(PStringLog() << "Failed to open loop-control");
+    return Failed::MakeError(PStringLog() << "Failed to open loop-control");
   }
 
   int num = ioctl(ctl_fd.get(), LOOP_CTL_GET_FREE);
   if (num == -1) {
-    return Status::Fail(PStringLog() << "Failed LOOP_CTL_GET_FREE");
+    return Failed::MakeError(PStringLog() << "Failed LOOP_CTL_GET_FREE");
   }
 
-  out_device = StringPrintf("/dev/block/loop%d", num);
+  std::string device = StringPrintf("/dev/block/loop%d", num);
 
   unique_fd target_fd(open(target.c_str(), O_RDONLY | O_CLOEXEC));
   if (target_fd.get() == -1) {
-    return Status::Fail(PStringLog() << "Failed to open " << target);
+    return Failed::MakeError(PStringLog() << "Failed to open " << target);
   }
-  unique_fd device_fd(open(out_device.c_str(), O_RDWR | O_CLOEXEC));
+  LoopbackDeviceUniqueFd device_fd(unique_fd(open(device.c_str(), O_RDWR | O_CLOEXEC)), device);
   if (device_fd.get() == -1) {
-    return Status::Fail(PStringLog() << "Failed to open " << out_device);
+    return Failed::MakeError(PStringLog() << "Failed to open " << device);
   }
 
   if (ioctl(device_fd.get(), LOOP_SET_FD, target_fd.get()) == -1) {
-    return Status::Fail(PStringLog() << "Failed to LOOP_SET_FD");
+    return Failed::MakeError(PStringLog() << "Failed to LOOP_SET_FD");
   }
 
   struct loop_info64 li;
@@ -102,7 +144,7 @@ Status createLoopDevice(const std::string& target, const int32_t imageOffset,
   li.lo_offset = imageOffset;
   li.lo_sizelimit = imageSize;
   if (ioctl(device_fd.get(), LOOP_SET_STATUS64, &li) == -1) {
-    return Status::Fail(PStringLog() << "Failed to LOOP_SET_STATUS64");
+    return Failed::MakeError(PStringLog() << "Failed to LOOP_SET_STATUS64");
   }
 
   // Direct-IO requires the loop device to have the same block size as the
@@ -117,7 +159,7 @@ Status createLoopDevice(const std::string& target, const int32_t imageOffset,
     }
   }
 
-  return Status::Success();
+  return StatusOr<LoopbackDeviceUniqueFd>(std::move(device_fd));
 }
 
 void destroyAllLoopDevices() {
@@ -423,23 +465,62 @@ std::unique_ptr<AvbHashtreeDescriptor> verifyDescriptor(
   return verifiedDesc;
 }
 
-std::string createVerityDevice(const std::string& name, const DmTable& table) {
-  std::string dev_path;
+class DmVerityDevice {
+ public:
+  DmVerityDevice() : cleared_(true) {}
+  DmVerityDevice(const std::string& name) : name_(name), cleared_(false) {}
+  DmVerityDevice(const std::string& name, const std::string& dev_path)
+      : name_(name), dev_path_(dev_path), cleared_(false) {}
+
+  DmVerityDevice(DmVerityDevice&& other)
+      : name_(other.name_), dev_path_(other.dev_path_), cleared_(other.cleared_) {
+    other.cleared_ = true;
+  }
+
+  ~DmVerityDevice() {
+    if (!cleared_) {
+      DeviceMapper& dm = DeviceMapper::Instance();
+      dm.DeleteDevice(name_);
+    }
+  }
+
+  const std::string& GetName() const {
+    return name_;
+  }
+  const std::string& GetDevPath() const {
+    return dev_path_;
+  }
+  void SetDevPath(const std::string& dev_path) {
+    dev_path_ = dev_path;
+  }
+
+  void Release() {
+    cleared_ = true;
+  }
+
+ private:
+  std::string name_;
+  std::string dev_path_;
+  bool cleared_;
+};
+
+StatusOr<DmVerityDevice> createVerityDevice(const std::string& name, const DmTable& table) {
   DeviceMapper& dm = DeviceMapper::Instance();
 
   dm.DeleteDevice(name);
 
   if (!dm.CreateDevice(name, table)) {
-    LOG(ERROR) << "Couldn't create verity device.";
-    return {};
+    return StatusOr<DmVerityDevice>::MakeError("Couldn't create verity device.");
   }
+  DmVerityDevice dev(name);
 
+  std::string dev_path;
   if (!dm.GetDmDevicePathByName(name, &dev_path)) {
-    LOG(ERROR) << "Couldn't get verity device path!";
-    return {};
+    return StatusOr<DmVerityDevice>::MakeError("Couldn't get verity device path!");
   }
+  dev.SetDevPath(dev_path);
 
-  return dev_path;
+  return StatusOr<DmVerityDevice>(std::move(dev));
 }
 
 // What this function verifies
@@ -518,11 +599,12 @@ Status mountPackage(const std::string& full_path) {
   std::string packageId =
       manifest->GetName() + "@" + std::to_string(manifest->GetVersion());
 
-  std::string loopback;
+  LoopbackDeviceUniqueFd loopbackDevice;
   for (size_t attempts = 1; ; ++attempts) {
-    Status ret = createLoopDevice(full_path, apex->GetImageOffset(),
-                                  apex->GetImageSize(), loopback);
+    StatusOr<LoopbackDeviceUniqueFd> ret = createLoopDevice(full_path, apex->GetImageOffset(),
+                                                            apex->GetImageSize());
     if (ret.Ok()) {
+      loopbackDevice = std::move(*ret);
       break;
     }
     if (attempts >= kLoopDeviceSetupAttempts) {
@@ -531,24 +613,27 @@ Status mountPackage(const std::string& full_path) {
                       << ret.ErrorMessage());
     }
   }
-  LOG(VERBOSE) << "Loopback device created: " << loopback;
+  LOG(VERBOSE) << "Loopback device created: " << loopbackDevice.name;
 
   auto verityData = verifyApexVerity(*apex);
   if (!verityData) {
     return Status(StringLog() << "Failed to verify Apex Verity data for " << full_path);
   }
 
-  auto verityTable = createVerityTable(*verityData, loopback);
-  std::string verityDevice = createVerityDevice(packageId, *verityTable);
-  if (verityDevice.empty()) {
-    return Status(StringLog() << "Failed to create Apex Verity device " << full_path);
+  auto verityTable = createVerityTable(*verityData, loopbackDevice.name);
+  StatusOr<DmVerityDevice> verityDevRes = createVerityDevice(packageId, *verityTable);
+  if (!verityDevRes.Ok()) {
+    return Status(
+        StringLog() << "Failed to create Apex Verity device " << full_path
+                    << ": " << verityDevRes.ErrorMessage());
   }
+  DmVerityDevice verityDev = std::move(*verityDevRes);
 
   std::string mountPoint = StringPrintf("%s/%s", kApexRoot, packageId.c_str());
   LOG(VERBOSE) << "Creating mount point: " << mountPoint;
   mkdir(mountPoint.c_str(), 0755);
 
-  if (mount(verityDevice.c_str(), mountPoint.c_str(), "ext4",
+  if (mount(verityDev.GetDevPath().c_str(), mountPoint.c_str(), "ext4",
             MS_NOATIME | MS_NODEV | MS_NOSUID | MS_DIRSYNC | MS_RDONLY,
             NULL) == 0) {
     LOG(INFO) << "Successfully mounted package " << full_path << " on "
@@ -557,21 +642,14 @@ Status mountPackage(const std::string& full_path) {
     // TODO: only create symlinks if we are sure we are mounting the latest
     //       version of a package.
     updateSymlink(manifest->GetName(), mountPoint);
+
+    // Time to accept the temporaries as good.
+    verityDev.Release();
+    loopbackDevice.CloseGood();
+
     return Status::Success();
-  } else {
-    Status res = Status::Fail(PStringLog() << "Mounting failed for package " << full_path);
-    // Tear down loop device.
-    unique_fd fd(open(loopback.c_str(), O_RDWR | O_CLOEXEC));
-    if (fd.get() != -1) {
-      if (ioctl(fd.get(), LOOP_CLR_FD, 0) < 0) {
-        PLOG(WARNING) << "Failed to clean up unused loop device " << loopback;
-      }
-    } else {
-      PLOG(WARNING) << "Failed to open " << loopback
-                    << " while attempting to clean up unused loop device";
-    }
-    return res;
   }
+  return Status::Fail(PStringLog() << "Mounting failed for package " << full_path);
 }
 
 void unmountAndDetachExistingImages() {
