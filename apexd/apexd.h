@@ -27,13 +27,14 @@ namespace android {
 namespace apex {
 
 static constexpr const char* kApexPackageDataDir = "/data/apex";
+static constexpr const char* kApexRoot = "/apex";
 
 void unmountAndDetachExistingImages();
 
-void scanPackagesDirAndMount(const char* apex_package_dir);
+void scanPackagesDirAndActivate(const char* apex_package_dir);
 
 Status installPackage(const std::string& packageTmpPath) WARN_UNUSED;
-Status mountPackage(const std::string& full_path) WARN_UNUSED;
+Status activatePackage(const std::string& full_path) WARN_UNUSED;
 
 void onStart();
 void onAllPackagesReady();
