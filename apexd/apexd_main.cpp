@@ -19,51 +19,32 @@
 #include "apexd.h"
 
 #include <android-base/logging.h>
-#include <binder/IPCThreadState.h>
-#include <binder/IServiceManager.h>
-#include <binder/ProcessState.h>
-#include <utils/String16.h>
 
 #include "apexservice.h"
-
-using android::defaultServiceManager;
-using android::IPCThreadState;
-using android::ProcessState;
-using android::sp;
-using android::String16;
-using android::apex::ApexService;
-
-static constexpr const char* kApexPackageSystemDir = "/system/apex";
-static constexpr const char* kApexServiceName = "apexservice";
 
 int main(int /*argc*/, char** argv) {
   android::base::InitLogging(argv);
 
   android::apex::onStart();
 
-  sp<ProcessState> ps(ProcessState::self());
-
   // TODO: add a -v flag or an external setting to change LogSeverity.
   android::base::SetMinimumLogSeverity(android::base::VERBOSE);
 
-  // Create binder service and register with servicemanager
-  sp<ApexService> apexService = new ApexService();
-  defaultServiceManager()->addService(String16(kApexServiceName), apexService);
+  android::apex::binder::CreateAndRegisterService();
 
   android::apex::unmountAndDetachExistingImages();
   // Scan the directory under /data first, as it may contain updates of APEX
   // packages living in the directory under /system, and we want the former ones
   // to be used over the latter ones.
   android::apex::scanPackagesDirAndActivate(android::apex::kApexPackageDataDir);
-  android::apex::scanPackagesDirAndActivate(kApexPackageSystemDir);
+  android::apex::scanPackagesDirAndActivate(
+      android::apex::kApexPackageSystemDir);
 
   // Notify other components (e.g. init) that all APEXs are correctly mounted
   // and are ready to be used.
   android::apex::onAllPackagesReady();
 
-  // Start threadpool, wait for IPC
-  ps->startThreadPool();
-  IPCThreadState::self()->joinThreadPool();  // should not return
+  android::apex::binder::JoinThreadPool();
 
   return 1;
 }
