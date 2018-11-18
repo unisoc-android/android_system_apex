@@ -24,13 +24,15 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/macros.h>
+#include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <binder/IServiceManager.h>
 #include <gtest/gtest.h>
 #include <selinux/selinux.h>
 
+#include <android/apex/ApexPackageInfo.h>
 #include <android/apex/IApexService.h>
-#include <android/apex/PackageInfo.h>
 
 #include "status_or.h"
 
@@ -66,10 +68,10 @@ class ApexServiceTest : public ::testing::Test {
   static bool IsSelinuxEnforced() { return 0 != security_getenforce(); }
 
   StatusOr<bool> IsActive(const std::string& name, int64_t version) {
-    std::vector<PackageInfo> list;
+    std::vector<ApexPackageInfo> list;
     android::binder::Status status = service_->getActivePackages(&list);
     if (status.isOk()) {
-      for (const PackageInfo& p : list) {
+      for (const ApexPackageInfo& p : list) {
         if (p.package_name == name && p.version_code == version) {
           return StatusOr<bool>(true);
         }
@@ -80,11 +82,11 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   std::vector<std::string> GetActivePackagesStrings() {
-    std::vector<PackageInfo> list;
+    std::vector<ApexPackageInfo> list;
     android::binder::Status status = service_->getActivePackages(&list);
     if (status.isOk()) {
       std::vector<std::string> ret;
-      for (const PackageInfo& p : list) {
+      for (const ApexPackageInfo& p : list) {
         ret.push_back(p.package_name + "@" + std::to_string(p.version_code));
       }
       return ret;
@@ -108,19 +110,42 @@ class ApexServiceTest : public ::testing::Test {
         ASSERT_EQ(0, access(GetTestFile().c_str(), F_OK))
             << GetTestFile() << ": " << strerror(errno);
         ASSERT_EQ(0, mkdir(kTestDir, 0777)) << strerror(errno);
-        ASSERT_TRUE(0 == setfilecon(kTestDir, "u:object_r:apex_data_file:s0") ||
-                    !HaveSelinux())
-            << strerror(errno);
 
-        ASSERT_EQ(0, link(GetTestFile().c_str(), kTestFile)) << strerror(errno);
-        ASSERT_TRUE(0 ==
-                        setfilecon(kTestFile, "u:object_r:apex_data_file:s0") ||
-                    !HaveSelinux())
-            << strerror(errno);
+        auto mode_info = [](const std::string& f) {
+          auto get_mode = [](const std::string& path) {
+            struct stat buf;
+            if (stat(path.c_str(), &buf) != 0) {
+              return std::string(strerror(errno));
+            }
+            return android::base::StringPrintf("%x", buf.st_mode);
+          };
+          std::string file_part = f + "(" + get_mode(f) + ")";
+
+          std::string dir = android::base::Dirname(f);
+          std::string dir_part = dir + "(" + get_mode(dir) + ")";
+
+          return file_part + " - " + dir_part;
+        };
+        int rc = link(GetTestFile().c_str(), kTestFile);
+        if (rc != 0) {
+          int saved_errno = errno;
+          ASSERT_EQ(0, rc) << mode_info(GetTestFile()) << " to "
+                           << mode_info(kTestFile) << " : "
+                           << strerror(saved_errno);
+        }
+
         ASSERT_EQ(0, chmod(kTestFile, 0777)) << strerror(errno);
         struct group* g = getgrnam("system");
         ASSERT_NE(nullptr, g);
         ASSERT_EQ(0, chown(kTestFile, /* root uid */ 0, g->gr_gid))
+            << strerror(errno);
+
+        ASSERT_TRUE(0 == setfilecon(kTestDir, "u:object_r:apex_data_file:s0") ||
+                    !HaveSelinux())
+            << strerror(errno);
+        ASSERT_TRUE(0 ==
+                        setfilecon(kTestFile, "u:object_r:apex_data_file:s0") ||
+                    !HaveSelinux())
             << strerror(errno);
       };
       prepare();
@@ -289,11 +314,31 @@ TEST_F(ApexServiceTest, Activate) {
   // TODO: Uninstall.
 }
 
+class LogTestToLogcat : public testing::EmptyTestEventListener {
+  void OnTestStart(const testing::TestInfo& test_info) override {
+#ifdef __ANDROID__
+    using base::LogId;
+    using base::LogSeverity;
+    using base::StringPrintf;
+    base::LogdLogger l;
+    std::string msg =
+        StringPrintf("=== %s::%s (%s:%d)", test_info.test_case_name(),
+                     test_info.name(), test_info.file(), test_info.line());
+    l(LogId::MAIN, LogSeverity::INFO, "apexservice_test", __FILE__, __LINE__,
+      msg.c_str());
+#else
+    UNUSED(test_info);
+#endif
+  }
+};
+
 }  // namespace apex
 }  // namespace android
 
 int main(int argc, char** argv) {
   android::base::InitLogging(argv, &android::base::StderrLogger);
   ::testing::InitGoogleTest(&argc, argv);
+  testing::UnitTest::GetInstance()->listeners().Append(
+      new android::apex::LogTestToLogcat());
   return RUN_ALL_TESTS();
 }
