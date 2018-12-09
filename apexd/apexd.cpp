@@ -17,10 +17,12 @@
 #define LOG_TAG "apexd"
 
 #include "apexd.h"
+#include "apexd_private.h"
 
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_manifest.h"
+#include "apexd_preinstall.h"
 #include "status_or.h"
 #include "string_log.h"
 
@@ -28,6 +30,7 @@
 #include <android-base/logging.h>
 #include <android-base/macros.h>
 #include <android-base/properties.h>
+#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
@@ -85,17 +88,7 @@ static constexpr const char* kApexStatusReady = "ready";
 
 static constexpr int kVbMetaMaxSize = 64 * 1024;
 
-static constexpr int kMkdirMode = 0755;
-
 MountedApexDatabase gMountedApexes;
-
-std::string GetPackageMountPoint(const ApexManifest& manifest) {
-  return StringPrintf("%s/%s", kApexRoot, manifest.GetPackageId().c_str());
-}
-
-std::string GetActiveMountPoint(const ApexManifest& manifest) {
-  return StringPrintf("%s/%s", kApexRoot, manifest.GetName().c_str());
-}
 
 struct LoopbackDeviceUniqueFd {
   unique_fd device_fd;
@@ -617,68 +610,6 @@ StatusOr<std::unique_ptr<ApexVerityData>> verifyApexVerity(
   return StatusOr<std::unique_ptr<ApexVerityData>>(std::move(verityData));
 }
 
-Status updateLatest(const std::string& latest_path,
-                    const std::string& mount_point) {
-  LOG(VERBOSE) << "Creating bind-mount for " << latest_path << " with target "
-               << mount_point;
-  // Ensure the directory exists, try to unmount.
-  {
-    bool exists;
-    bool is_dir;
-    {
-      struct stat buf;
-      if (stat(latest_path.c_str(), &buf) != 0) {
-        if (errno == ENOENT) {
-          exists = false;
-          is_dir = false;
-        } else {
-          PLOG(ERROR) << "Could not stat target directory " << latest_path;
-          // Still attempt to bind-mount.
-          exists = true;
-          is_dir = true;
-        }
-      } else {
-        exists = true;
-        is_dir = S_ISDIR(buf.st_mode);
-      }
-    }
-
-    // Ensure that it is a folder.
-    if (exists && !is_dir) {
-      LOG(WARNING) << latest_path << " is not a directory, attempting to fix";
-      if (unlink(latest_path.c_str()) != 0) {
-        PLOG(ERROR) << "Failed to unlink " << latest_path;
-        // Try mkdir, anyways.
-      }
-      exists = false;
-    }
-    // And create it if necessary.
-    if (!exists) {
-      LOG(VERBOSE) << "Creating mountpoint " << latest_path;
-      if (mkdir(latest_path.c_str(), kMkdirMode) != 0) {
-        return Status::Fail(PStringLog()
-                            << "Could not create mountpoint " << latest_path);
-      }
-    };
-    // Unmount any active bind-mount.
-    if (exists) {
-      int rc = umount2(latest_path.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH);
-      if (rc != 0 && errno != EINVAL) {
-        // Log error but ignore.
-        PLOG(ERROR) << "Could not unmount " << latest_path;
-      }
-    }
-  }
-
-  LOG(VERBOSE) << "Bind-mounting " << mount_point << " to " << latest_path;
-  if (mount(mount_point.c_str(), latest_path.c_str(), nullptr, MS_BIND,
-            nullptr) == 0) {
-    return Status::Success();
-  }
-  return Status::Fail(PStringLog() << "Could not bind-mount " << mount_point
-                                   << " to " << latest_path);
-}
-
 StatusOr<std::vector<std::string>> getApexRootSubFolders() {
   // This code would be much shorter if C++17's std::filesystem were available,
   // which is not at the time of writing this.
@@ -799,8 +730,7 @@ Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
                       << "Mounting failed for package " << full_path);
 }
 
-Status mountFlattened(const ApexFile& apex,
-                      const std::string& mountPoint,
+Status mountFlattened(const ApexFile& apex, const std::string& mountPoint,
                       MountedApexData* apex_data) {
   if (!android::base::StartsWith(apex.GetPath(), kApexPackageSystemDir)) {
     return Status::Fail(StringLog()
@@ -820,26 +750,6 @@ Status mountFlattened(const ApexFile& apex,
                                    << apex.GetPath());
 }
 
-Status mountPackage(const ApexFile& apex, const std::string& mountPoint,
-                    MountedApexData* data) {
-  LOG(VERBOSE) << "Creating mount point: " << mountPoint;
-  if (mkdir(mountPoint.c_str(), kMkdirMode) != 0) {
-    return Status::Fail(PStringLog()
-                        << "Could not create mount point " << mountPoint);
-  }
-
-  Status st = apex.IsFlattened() ? mountFlattened(apex, mountPoint, data)
-                                 : mountNonFlattened(apex, mountPoint, data);
-  if (!st.Ok()) {
-    if (!rmdir(mountPoint.c_str())) {
-      PLOG(WARNING) << "Could not rmdir " << mountPoint;
-    }
-    return st;
-  }
-
-  return Status::Success();
-}
-
 Status deactivatePackageImpl(const ApexFile& apex) {
   // TODO: It's not clear what the right thing to do is for umount failures.
 
@@ -847,7 +757,7 @@ Status deactivatePackageImpl(const ApexFile& apex) {
   // Unmount "latest" bind-mount.
   // TODO: What if bind-mount isn't latest?
   {
-    std::string mount_point = GetActiveMountPoint(manifest);
+    std::string mount_point = apexd_private::GetActiveMountPoint(manifest);
     LOG(VERBOSE) << "Unmounting and deleting " << mount_point;
     if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0) {
       return Status::Fail(PStringLog() << "Failed to unmount " << mount_point);
@@ -858,7 +768,7 @@ Status deactivatePackageImpl(const ApexFile& apex) {
     }
   }
 
-  std::string mount_point = GetPackageMountPoint(manifest);
+  std::string mount_point = apexd_private::GetPackageMountPoint(manifest);
   LOG(VERBOSE) << "Unmounting and deleting " << mount_point;
   if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0) {
     return Status::Fail(PStringLog() << "Failed to unmount " << mount_point);
@@ -886,6 +796,49 @@ Status deactivatePackageImpl(const ApexFile& apex) {
 }
 
 }  // namespace
+
+namespace apexd_private {
+
+Status MountPackage(const ApexFile& apex, const std::string& mountPoint,
+                    MountedApexData* data) {
+  LOG(VERBOSE) << "Creating mount point: " << mountPoint;
+  if (mkdir(mountPoint.c_str(), kMkdirMode) != 0) {
+    return Status::Fail(PStringLog()
+                        << "Could not create mount point " << mountPoint);
+  }
+
+  Status st = apex.IsFlattened() ? mountFlattened(apex, mountPoint, data)
+                                 : mountNonFlattened(apex, mountPoint, data);
+  if (!st.Ok()) {
+    if (!rmdir(mountPoint.c_str())) {
+      PLOG(WARNING) << "Could not rmdir " << mountPoint;
+    }
+    return st;
+  }
+
+  return Status::Success();
+}
+
+bool IsMounted(const std::string& name, const std::string& full_path) {
+  bool found_mounted = false;
+  gMountedApexes.ForallMountedApexes(
+      name, [&](const MountedApexData& data, bool latest ATTRIBUTE_UNUSED) {
+        if (full_path == data.full_path) {
+          found_mounted = true;
+        }
+      });
+  return found_mounted;
+}
+
+std::string GetPackageMountPoint(const ApexManifest& manifest) {
+  return StringPrintf("%s/%s", kApexRoot, manifest.GetPackageId().c_str());
+}
+
+std::string GetActiveMountPoint(const ApexManifest& manifest) {
+  return StringPrintf("%s/%s", kApexRoot, manifest.GetName().c_str());
+}
+
+}  // namespace apexd_private
 
 Status activatePackage(const std::string& full_path) {
   LOG(INFO) << "Trying to activate " << full_path;
@@ -925,12 +878,13 @@ Status activatePackage(const std::string& full_path) {
     }
   }
 
-  std::string mountPoint = GetPackageMountPoint(manifest);
+  std::string mountPoint = apexd_private::GetPackageMountPoint(manifest);
 
   MountedApexData apex_data("", full_path);
 
   if (!version_found_mounted) {
-    Status mountStatus = mountPackage(*apexFile, mountPoint, &apex_data);
+    Status mountStatus =
+        apexd_private::MountPackage(*apexFile, mountPoint, &apex_data);
     if (!mountStatus.Ok()) {
       return mountStatus;
     }
@@ -938,7 +892,8 @@ Status activatePackage(const std::string& full_path) {
 
   bool mounted_latest = false;
   if (is_newest_version) {
-    Status update_st = updateLatest(GetActiveMountPoint(manifest), mountPoint);
+    Status update_st = apexd_private::BindMount(
+        apexd_private::GetActiveMountPoint(manifest), mountPoint);
     mounted_latest = update_st.Ok();
     if (!update_st.Ok()) {
       // TODO: Fail?
@@ -1075,6 +1030,15 @@ Status stagePackage(const std::string& packageTmpPath) {
     return Status::Fail(PStringLog() << "Unable to rename " << packageTmpPath
                                      << " to " << destPath);
   }
+
+  // Ensure the APEX gets removed on failure.
+  auto deleter = [&destPath]() {
+    if (TEMP_FAILURE_RETRY(unlink(destPath.c_str())) != 0) {
+      PLOG(ERROR) << "Unable to unlink " << destPath;
+    }
+  };
+  auto scope_guard = android::base::make_scope_guard(deleter);
+
   // TODO(b/112669193) remove this. Move the file from packageTmpPath to
   // destPath using file descriptor.
   if (selinux_android_restorecon(destPath.c_str(), 0) < 0) {
@@ -1082,6 +1046,22 @@ Status stagePackage(const std::string& packageTmpPath) {
                                      << " error: " << strerror(errno));
   }
   LOG(DEBUG) << "Success renaming " << packageTmpPath << " to " << destPath;
+
+  if (!apexFile->GetManifest().GetPreInstallHook().empty()) {
+    // Need to recreate the APEX file, as it points to the packageTmpPath.
+    StatusOr<ApexFile> stagedApexFile = ApexFile::Open(destPath);
+    if (stagedApexFile.Ok()) {
+      Status preinstall_status = StagePreInstall(*stagedApexFile);
+      if (!preinstall_status.Ok()) {
+        return preinstall_status;
+      }
+    } else {
+      return Status::Fail(std::string("Failed reloading staged apex: ")
+                              .append(stagedApexFile.ErrorMessage()));
+    }
+  }
+
+  scope_guard.Disable();  // Accept the state.
   return Status::Success();
 }
 

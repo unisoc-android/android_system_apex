@@ -44,7 +44,11 @@ cc_binary {
     "apex_defaults",
     "libapexservice-deps",
   ],
-  srcs: ["apexd_main.cpp"],
+  srcs: [
+    "apexd_main.cpp",
+    "apexd_preinstall.cpp",
+    "apexd_private.cpp",
+  ],
   static_libs: [
     "libapex",
     "libapexd",
@@ -138,7 +142,10 @@ cc_test {
   data: ["apexd_testdata/*"],
   srcs: ["apexservice_test.cpp"],
   host_supported: false,
-  static_libs: ["apex_aidl_interface-cpp"],
+  static_libs: [
+    "apex_aidl_interface-cpp",
+    "libapex",
+  ],
   shared_libs: [
     "libbinder",
     "libselinux",
