@@ -226,7 +226,9 @@ void destroyAllLoopDevices() {
 
     struct loop_info64 li;
     if (ioctl(fd.get(), LOOP_GET_STATUS64, &li) < 0) {
-      PLOG(WARNING) << "Failed to LOOP_GET_STATUS64 " << path;
+      if (errno != ENXIO) {
+        PLOG(WARNING) << "Failed to LOOP_GET_STATUS64 " << path;
+      }
       continue;
     }
 
@@ -833,7 +835,7 @@ Status MountPackage(const ApexFile& apex, const std::string& mountPoint,
   Status st = apex.IsFlattened() ? mountFlattened(apex, mountPoint, data)
                                  : mountNonFlattened(apex, mountPoint, data);
   if (!st.Ok()) {
-    if (!rmdir(mountPoint.c_str())) {
+    if (rmdir(mountPoint.c_str()) != 0) {
       PLOG(WARNING) << "Could not rmdir " << mountPoint;
     }
     return st;
