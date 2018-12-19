@@ -41,8 +41,8 @@ Status BindMount(const std::string& target, const std::string& source);
 
 bool IsMounted(const std::string& name, const std::string& full_path);
 
-Status MountPackage(const ApexFile& apex, const std::string& mountPoint,
-                    MountedApexData* data);
+Status MountPackage(const ApexFile& apex, const std::string& mountPoint);
+Status UnmountPackage(const ApexFile& apex);
 
 }  // namespace apexd_private
 }  // namespace apex

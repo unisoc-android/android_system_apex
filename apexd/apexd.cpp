@@ -200,6 +200,34 @@ StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
   return StatusOr<LoopbackDeviceUniqueFd>(std::move(device_fd));
 }
 
+template <typename T>
+void DestroyLoopDevice(const std::string& path, T extra) {
+  unique_fd fd(open(path.c_str(), O_RDWR | O_CLOEXEC));
+  if (fd.get() == -1) {
+    if (errno != ENOENT) {
+      PLOG(WARNING) << "Failed to open " << path;
+    }
+    return;
+  }
+
+  struct loop_info64 li;
+  if (ioctl(fd.get(), LOOP_GET_STATUS64, &li) < 0) {
+    if (errno != ENXIO) {
+      PLOG(WARNING) << "Failed to LOOP_GET_STATUS64 " << path;
+    }
+    return;
+  }
+
+  auto id = std::string((char*)li.lo_crypt_name);
+  if (android::base::StartsWith(id, kApexLoopIdPrefix)) {
+    extra(path, id);
+
+    if (ioctl(fd.get(), LOOP_CLR_FD, 0) < 0) {
+      PLOG(WARNING) << "Failed to LOOP_CLR_FD " << path;
+    }
+  }
+}
+
 void destroyAllLoopDevices() {
   std::string root = "/dev/block/";
   auto dirp =
@@ -210,40 +238,17 @@ void destroyAllLoopDevices() {
   }
 
   // Poke through all devices looking for loop devices.
+  auto log_fn = [](const std::string& path, const std::string& id) {
+    LOG(DEBUG) << "Tearing down stale loop device at " << path << " named "
+               << id;
+  };
   struct dirent* de;
   while ((de = readdir(dirp.get()))) {
     auto test = std::string(de->d_name);
     if (!android::base::StartsWith(test, "loop")) continue;
 
     auto path = root + de->d_name;
-    unique_fd fd(open(path.c_str(), O_RDWR | O_CLOEXEC));
-    if (fd.get() == -1) {
-      if (errno != ENOENT) {
-        PLOG(WARNING) << "Failed to open " << path;
-      }
-      continue;
-    }
-
-    struct loop_info64 li;
-    if (ioctl(fd.get(), LOOP_GET_STATUS64, &li) < 0) {
-      if (errno != ENXIO) {
-        PLOG(WARNING) << "Failed to LOOP_GET_STATUS64 " << path;
-      }
-      continue;
-    }
-
-    auto id = std::string((char*)li.lo_crypt_name);
-    if (android::base::StartsWith(id, kApexLoopIdPrefix)) {
-      LOG(DEBUG) << "Tearing down stale loop device at " << path << " named "
-                 << id;
-
-      if (ioctl(fd.get(), LOOP_CLR_FD, 0) < 0) {
-        PLOG(WARNING) << "Failed to LOOP_CLR_FD " << path;
-      }
-    } else {
-      LOG(VERBOSE) << "Found unmanaged loop device at " << path << " named "
-                   << id;
-    }
+    DestroyLoopDevice(path, log_fn);
   }
 }
 
@@ -824,21 +829,78 @@ Status deactivatePackageImpl(const ApexFile& apex) {
 
 namespace apexd_private {
 
-Status MountPackage(const ApexFile& apex, const std::string& mountPoint,
-                    MountedApexData* data) {
+Status MountPackage(const ApexFile& apex, const std::string& mountPoint) {
   LOG(VERBOSE) << "Creating mount point: " << mountPoint;
   if (mkdir(mountPoint.c_str(), kMkdirMode) != 0) {
     return Status::Fail(PStringLog()
                         << "Could not create mount point " << mountPoint);
   }
 
-  Status st = apex.IsFlattened() ? mountFlattened(apex, mountPoint, data)
-                                 : mountNonFlattened(apex, mountPoint, data);
+  MountedApexData data("", apex.GetPath());
+  Status st = apex.IsFlattened() ? mountFlattened(apex, mountPoint, &data)
+                                 : mountNonFlattened(apex, mountPoint, &data);
   if (!st.Ok()) {
     if (rmdir(mountPoint.c_str()) != 0) {
       PLOG(WARNING) << "Could not rmdir " << mountPoint;
     }
     return st;
+  }
+
+  gMountedApexes.AddMountedApex(apex.GetManifest().GetName(), false,
+                                std::move(data));
+  return Status::Success();
+}
+
+Status UnmountPackage(const ApexFile& apex) {
+  LOG(VERBOSE) << "Unmounting " << apex.GetManifest().GetPackageId();
+
+  const ApexManifest& manifest = apex.GetManifest();
+
+  const MountedApexData* data = nullptr;
+  bool latest = false;
+
+  gMountedApexes.ForallMountedApexes(manifest.GetName(),
+                                     [&](const MountedApexData& d, bool l) {
+                                       if (d.full_path == apex.GetPath()) {
+                                         data = &d;
+                                         latest = l;
+                                       }
+                                     });
+
+  if (data == nullptr) {
+    return Status::Fail(StringLog() << "Did not find " << apex.GetPath());
+  }
+
+  if (latest) {
+    return Status::Fail(StringLog()
+                        << "Package " << apex.GetPath() << " is active");
+  }
+
+  std::string mount_point = apexd_private::GetPackageMountPoint(manifest);
+  // Lazily try to umount whatever is mounted.
+  if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
+      errno != EINVAL && errno != ENOENT) {
+    return Status::Fail(PStringLog()
+                        << "Failed to unmount directory " << mount_point);
+  }
+
+  // Clean up gMountedApexes now, even though we're not fully done.
+  std::string loop = data->loop_name;
+  gMountedApexes.RemoveMountedApex(manifest.GetName(), apex.GetPath());
+
+  // Attempt to delete the folder. If the folder is retained, other
+  // data may be incorrect.
+  if (rmdir(mount_point.c_str()) != 0) {
+    PLOG(ERROR) << "Failed to rmdir directory " << mount_point;
+  }
+
+  // Try to free up the loop device.
+  if (!loop.empty()) {
+    auto log_fn = [](const std::string& path,
+                     const std::string& id ATTRIBUTE_UNUSED) {
+      LOG(VERBOSE) << "Freeing loop device " << path << "for unmount.";
+    };
+    DestroyLoopDevice(loop, log_fn);
   }
 
   return Status::Success();
@@ -905,11 +967,8 @@ Status activatePackage(const std::string& full_path) {
 
   std::string mountPoint = apexd_private::GetPackageMountPoint(manifest);
 
-  MountedApexData apex_data("", full_path);
-
   if (!version_found_mounted) {
-    Status mountStatus =
-        apexd_private::MountPackage(*apexFile, mountPoint, &apex_data);
+    Status mountStatus = apexd_private::MountPackage(*apexFile, mountPoint);
     if (!mountStatus.Ok()) {
       return mountStatus;
     }
@@ -925,11 +984,9 @@ Status activatePackage(const std::string& full_path) {
       LOG(ERROR) << update_st.ErrorMessage();
     }
   }
-  if (found_other_version && mounted_latest) {
-    gMountedApexes.UnsetLatestForall(manifest.GetName());
+  if (mounted_latest) {
+    gMountedApexes.SetLatest(manifest.GetName(), full_path);
   }
-  gMountedApexes.AddMountedApex(manifest.GetName(), mounted_latest,
-                                std::move(apex_data));
 
   return Status::Success();
 }
