@@ -57,12 +57,12 @@
 #include <memory>
 #include <string>
 
-using android::base::Basename;
 using android::base::EndsWith;
 using android::base::ReadFullyAtOffset;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::dm::DeviceMapper;
+using android::dm::DmDeviceState;
 using android::dm::DmTable;
 using android::dm::DmTargetVerity;
 
@@ -122,6 +122,31 @@ struct LoopbackDeviceUniqueFd {
 
   int get() { return device_fd.get(); }
 };
+
+Status configureReadAhead(const std::string& device_path) {
+  auto pos = device_path.find("/dev/block/");
+  if (pos != 0) {
+    return Status::Fail(StringLog()
+                        << "Device path does not start with /dev/block.");
+  }
+  pos = device_path.find_last_of("/");
+  std::string device_name = device_path.substr(pos + 1, std::string::npos);
+
+  std::string sysfs_device =
+      StringPrintf("/sys/block/%s/queue/read_ahead_kb", device_name.c_str());
+  unique_fd sysfs_fd(open(sysfs_device.c_str(), O_RDWR | O_CLOEXEC));
+  if (sysfs_fd.get() == -1) {
+    return Status::Fail(PStringLog() << "Failed to open " << sysfs_device);
+  }
+
+  int ret = TEMP_FAILURE_RETRY(
+      write(sysfs_fd.get(), kReadAheadKb, strlen(kReadAheadKb) + 1));
+  if (ret < 0) {
+    return Status::Fail(PStringLog() << "Failed to write to " << sysfs_device);
+  }
+
+  return Status::Success();
+}
 
 StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
                                                   const int32_t imageOffset,
@@ -197,6 +222,10 @@ StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
     }
   }
 
+  Status readAheadStatus = configureReadAhead(device);
+  if (!readAheadStatus.Ok()) {
+    return Failed::MakeError(StringLog() << readAheadStatus.ErrorMessage());
+  }
   return StatusOr<LoopbackDeviceUniqueFd>(std::move(device_fd));
 }
 
@@ -566,7 +595,10 @@ StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
                                             const DmTable& table) {
   DeviceMapper& dm = DeviceMapper::Instance();
 
-  dm.DeleteDevice(name);
+  if (dm.GetState(name) != DmDeviceState::INVALID) {
+    LOG(WARNING) << "Deleting existing dm device " << name;
+    dm.DeleteDevice(name);
+  }
 
   if (!dm.CreateDevice(name, table)) {
     return StatusOr<DmVerityDevice>::MakeError(
@@ -660,31 +692,6 @@ StatusOr<std::vector<std::string>> getApexRootSubFolders() {
   }
 
   return StatusOr<std::vector<std::string>>(std::move(ret));
-}
-
-Status configureReadAhead(const std::string& device_path) {
-  auto pos = device_path.find("/dev/block/");
-  if (pos != 0) {
-    return Status::Fail(StringLog()
-                        << "Device path does not start with /dev/block.");
-  }
-  pos = device_path.find_last_of("/");
-  std::string device_name = device_path.substr(pos + 1, std::string::npos);
-
-  std::string sysfs_device =
-      StringPrintf("/sys/block/%s/queue/read_ahead_kb", device_name.c_str());
-  unique_fd sysfs_fd(open(sysfs_device.c_str(), O_RDWR | O_CLOEXEC));
-  if (sysfs_fd.get() == -1) {
-    return Status::Fail(PStringLog() << "Failed to open " << sysfs_device);
-  }
-
-  int ret = TEMP_FAILURE_RETRY(
-      write(sysfs_fd.get(), kReadAheadKb, strlen(kReadAheadKb) + 1));
-  if (ret < 0) {
-    return Status::Fail(PStringLog() << "Failed to write to " << sysfs_device);
-  }
-
-  return Status::Success();
 }
 
 Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
