@@ -79,7 +79,6 @@ static constexpr const char* kApexKeySystemDirectory =
     "/system/etc/security/apex/";
 static constexpr const char* kApexKeyProductDirectory =
     "/product/etc/security/apex/";
-static constexpr const char* kApexKeyProp = "apex.key";
 
 // 128 kB read-ahead, which we currently use for /system as well
 static constexpr const char* kReadAheadKb = "128";
@@ -88,8 +87,6 @@ static constexpr const char* kReadAheadKb = "128";
 static constexpr const char* kApexStatusSysprop = "apexd.status";
 static constexpr const char* kApexStatusStarting = "starting";
 static constexpr const char* kApexStatusReady = "ready";
-
-static constexpr int kVbMetaMaxSize = 64 * 1024;
 
 MountedApexDatabase gMountedApexes;
 
@@ -285,38 +282,7 @@ void destroyAllLoopDevices() {
 }
 
 static constexpr size_t kLoopDeviceSetupAttempts = 3u;
-
-std::string bytes_to_hex(const uint8_t* bytes, size_t bytes_len) {
-  std::ostringstream s;
-
-  s << std::hex << std::setfill('0');
-  for (size_t i = 0; i < bytes_len; i++) {
-    s << std::setw(2) << static_cast<int>(bytes[i]);
-  }
-  return s.str();
-}
-
-std::string getSalt(const AvbHashtreeDescriptor& desc,
-                    const uint8_t* trailingData) {
-  const uint8_t* desc_salt = trailingData + desc.partition_name_len;
-
-  return bytes_to_hex(desc_salt, desc.salt_len);
-}
-
-std::string getDigest(const AvbHashtreeDescriptor& desc,
-                      const uint8_t* trailingData) {
-  const uint8_t* desc_digest =
-      trailingData + desc.partition_name_len + desc.salt_len;
-
-  return bytes_to_hex(desc_digest, desc.root_digest_len);
-}
-
-// Data needed to construct a valid VerityTable
-struct ApexVerityData {
-  std::unique_ptr<AvbHashtreeDescriptor> desc;
-  std::string salt;
-  std::string root_digest;
-};
+static constexpr size_t kMountAttempts = 5u;
 
 std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
                                            const std::string& loop) {
@@ -339,230 +305,6 @@ std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
   table->set_readonly(true);
 
   return table;
-}
-
-StatusOr<std::unique_ptr<AvbFooter>> getAvbFooter(const ApexFile& apex,
-                                                  const unique_fd& fd) {
-  std::array<uint8_t, AVB_FOOTER_SIZE> footer_data;
-  auto footer = std::make_unique<AvbFooter>();
-
-  // The AVB footer is located in the last part of the image
-  off_t offset = apex.GetImageSize() + apex.GetImageOffset() - AVB_FOOTER_SIZE;
-  int ret = lseek(fd, offset, SEEK_SET);
-  if (ret == -1) {
-    return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
-        PStringLog() << "Couldn't seek to AVB footer.");
-  }
-
-  ret = read(fd, footer_data.data(), AVB_FOOTER_SIZE);
-  if (ret != AVB_FOOTER_SIZE) {
-    return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
-        PStringLog() << "Couldn't read AVB footer.");
-  }
-
-  if (!avb_footer_validate_and_byteswap((const AvbFooter*)footer_data.data(),
-                                        footer.get())) {
-    return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
-        StringLog() << "AVB footer verification failed.");
-  }
-
-  LOG(VERBOSE) << "AVB footer verification successful.";
-  return StatusOr<std::unique_ptr<AvbFooter>>(std::move(footer));
-}
-
-// TODO We'll want to cache the verified key to avoid having to read it every
-// time.
-Status verifyPublicKey(const uint8_t* key, size_t length,
-                       std::string acceptedKeyFile) {
-  std::ifstream pubkeyFile(acceptedKeyFile, std::ios::binary | std::ios::ate);
-  if (pubkeyFile.bad()) {
-    return Status::Fail(StringLog() << "Can't open " << acceptedKeyFile);
-  }
-
-  std::streamsize size = pubkeyFile.tellg();
-  if (size < 0) {
-    return Status::Fail(StringLog()
-                        << "Could not get public key length position");
-  }
-
-  if (static_cast<size_t>(size) != length) {
-    return Status::Fail(StringLog()
-                        << "Public key length (" << std::to_string(size) << ")"
-                        << " doesn't equal APEX public key length ("
-                        << std::to_string(length) << ")");
-  }
-
-  pubkeyFile.seekg(0, std::ios::beg);
-
-  std::string verifiedKey(size, 0);
-  pubkeyFile.read(&verifiedKey[0], size);
-  if (pubkeyFile.bad()) {
-    return Status::Fail(StringLog() << "Can't read from " << acceptedKeyFile);
-  }
-
-  if (memcmp(&verifiedKey[0], key, length) != 0) {
-    return Status::Fail("Failed to compare verified key with key");
-  }
-  return Status::Success();
-}
-
-// Check for the existence of fileName under dirName. This function also ensures
-// that the file is no a symlink that points to a file outside of dirName.
-StatusOr<std::string> checkFile(const std::string& fileName,
-                                const std::string& dirName) {
-  std::string filePath(dirName);
-  filePath.append(fileName);
-  std::string canonicalFilePath;
-  if (!android::base::Realpath(filePath, &canonicalFilePath)) {
-    return StatusOr<std::string>::MakeError(
-        PStringLog() << "Failed to get realpath of " << filePath);
-  }
-
-  if (!android::base::StartsWith(canonicalFilePath, dirName)) {
-    return StatusOr<std::string>::MakeError(StringLog()
-                                            << "File " << canonicalFilePath
-                                            << " is not under " << dirName);
-  }
-
-  return StatusOr<std::string>(canonicalFilePath);
-}
-
-StatusOr<std::string> getPublicKeyFilePath(const ApexFile& apex,
-                                           const uint8_t* data, size_t length) {
-  size_t keyNameLen;
-  const char* keyName = avb_property_lookup(data, length, kApexKeyProp,
-                                            strlen(kApexKeyProp), &keyNameLen);
-  if (keyName == nullptr || keyNameLen == 0) {
-    return StatusOr<std::string>::MakeError(
-        StringLog() << "Cannot find prop '" << kApexKeyProp << "' from "
-                    << apex.GetPath());
-  }
-
-  if (keyName != apex.GetManifest().GetName()) {
-    return StatusOr<std::string>::MakeError(
-        StringLog() << "Key mismatch: apex name is '"
-                    << apex.GetManifest().GetName() << "'"
-                    << " but key name is '" << keyName << "'");
-  }
-
-  std::string keyNameStr(keyName, keyNameLen);
-  StatusOr<std::string> ret = checkFile(keyNameStr, kApexKeySystemDirectory);
-  if (!ret.Ok()) {
-    ret = checkFile(keyNameStr, kApexKeyProductDirectory);
-  }
-  return ret;
-}
-
-Status verifyVbMetaSignature(const ApexFile& apex, const uint8_t* data,
-                             size_t length) {
-  const uint8_t* pk;
-  size_t pk_len;
-  AvbVBMetaVerifyResult res;
-
-  res = avb_vbmeta_image_verify(data, length, &pk, &pk_len);
-  switch (res) {
-    case AVB_VBMETA_VERIFY_RESULT_OK:
-      break;
-    case AVB_VBMETA_VERIFY_RESULT_OK_NOT_SIGNED:
-    case AVB_VBMETA_VERIFY_RESULT_HASH_MISMATCH:
-    case AVB_VBMETA_VERIFY_RESULT_SIGNATURE_MISMATCH:
-      return Status::Fail(StringLog()
-                          << "Error verifying " << apex.GetPath() << ": "
-                          << avb_vbmeta_verify_result_to_string(res));
-    case AVB_VBMETA_VERIFY_RESULT_INVALID_VBMETA_HEADER:
-      return Status::Fail(StringLog()
-                          << "Error verifying " << apex.GetPath() << ": "
-                          << "invalid vbmeta header");
-    case AVB_VBMETA_VERIFY_RESULT_UNSUPPORTED_VERSION:
-      return Status::Fail(StringLog()
-                          << "Error verifying " << apex.GetPath() << ": "
-                          << "unsupported version");
-    default:
-      return Status::Fail("Unknown vmbeta_image_verify return value");
-  }
-
-  StatusOr<std::string> keyFilePath = getPublicKeyFilePath(apex, data, length);
-  if (!keyFilePath.Ok()) {
-    return keyFilePath.ErrorStatus();
-  }
-
-  // TODO(b/115718846)
-  // We need to decide whether we need rollback protection, and whether
-  // we can use the rollback protection provided by libavb.
-  Status st = verifyPublicKey(pk, pk_len, *keyFilePath);
-  if (st.Ok()) {
-    LOG(VERBOSE) << apex.GetPath() << ": public key matches.";
-    return st;
-  }
-  return Status::Fail(StringLog()
-                      << "Error verifying " << apex.GetPath() << ": "
-                      << "couldn't verify public key: " << st.ErrorMessage());
-}
-
-StatusOr<std::unique_ptr<uint8_t[]>> verifyVbMeta(const ApexFile& apex,
-                                                  const unique_fd& fd,
-                                                  const AvbFooter& footer) {
-  if (footer.vbmeta_size > kVbMetaMaxSize) {
-    return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(
-        "VbMeta size in footer exceeds kVbMetaMaxSize.");
-  }
-
-  off_t offset = apex.GetImageOffset() + footer.vbmeta_offset;
-  std::unique_ptr<uint8_t[]> vbmeta_buf(new uint8_t[footer.vbmeta_size]);
-
-  if (!ReadFullyAtOffset(fd, vbmeta_buf.get(), footer.vbmeta_size, offset)) {
-    return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(
-        PStringLog() << "Couldn't read AVB meta-data.");
-  }
-
-  Status st = verifyVbMetaSignature(apex, vbmeta_buf.get(), footer.vbmeta_size);
-  if (!st.Ok()) {
-    return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(st.ErrorMessage());
-  }
-
-  return StatusOr<std::unique_ptr<uint8_t[]>>(std::move(vbmeta_buf));
-}
-
-StatusOr<const AvbHashtreeDescriptor*> findDescriptor(uint8_t* vbmeta_data,
-                                                      size_t vbmeta_size) {
-  const AvbDescriptor** descriptors;
-  size_t num_descriptors;
-
-  descriptors =
-      avb_descriptor_get_all(vbmeta_data, vbmeta_size, &num_descriptors);
-
-  for (size_t i = 0; i < num_descriptors; i++) {
-    AvbDescriptor desc;
-    if (!avb_descriptor_validate_and_byteswap(descriptors[i], &desc)) {
-      return StatusOr<const AvbHashtreeDescriptor*>::MakeError(
-          "Couldn't validate AvbDescriptor.");
-    }
-
-    if (desc.tag != AVB_DESCRIPTOR_TAG_HASHTREE) {
-      // Ignore other descriptors
-      continue;
-    }
-
-    return StatusOr<const AvbHashtreeDescriptor*>(
-        (const AvbHashtreeDescriptor*)descriptors[i]);
-  }
-
-  return StatusOr<const AvbHashtreeDescriptor*>::MakeError(
-      "Couldn't find any AVB hashtree descriptors.");
-}
-
-StatusOr<std::unique_ptr<AvbHashtreeDescriptor>> verifyDescriptor(
-    const AvbHashtreeDescriptor* desc) {
-  auto verifiedDesc = std::make_unique<AvbHashtreeDescriptor>();
-
-  if (!avb_hashtree_descriptor_validate_and_byteswap(desc,
-                                                     verifiedDesc.get())) {
-    StatusOr<std::unique_ptr<AvbHashtreeDescriptor>>::MakeError(
-        "Couldn't validate AvbDescriptor.");
-  }
-
-  return StatusOr<std::unique_ptr<AvbHashtreeDescriptor>>(
-      std::move(verifiedDesc));
 }
 
 class DmVerityDevice {
@@ -631,62 +373,6 @@ StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
   return StatusOr<DmVerityDevice>(std::move(dev));
 }
 
-// What this function verifies
-// 1. The apex file has an AVB footer and that it's valid
-// 2. The apex file has a vb metadata structure that is valid
-// 3. The vb metadata structure is signed with the correct key
-// 4. The vb metadata contains a valid AvbHashTreeDescriptor
-//
-// If all these steps pass, this function returns an ApexVerityTable
-// struct with all the data necessary to create a dm-verity device for this
-// APEX.
-StatusOr<std::unique_ptr<ApexVerityData>> verifyApexVerity(
-    const ApexFile& apex) {
-  auto verityData = std::make_unique<ApexVerityData>();
-
-  unique_fd fd(open(apex.GetPath().c_str(), O_RDONLY | O_CLOEXEC));
-  if (fd.get() == -1) {
-    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
-        PStringLog() << "Failed to open " << apex.GetPath());
-  }
-
-  StatusOr<std::unique_ptr<AvbFooter>> footer = getAvbFooter(apex, fd);
-  if (!footer.Ok()) {
-    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
-        footer.ErrorMessage());
-  }
-
-  StatusOr<std::unique_ptr<uint8_t[]>> vbmeta_data =
-      verifyVbMeta(apex, fd, **footer);
-  if (!vbmeta_data.Ok()) {
-    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
-        vbmeta_data.ErrorMessage());
-  }
-
-  StatusOr<const AvbHashtreeDescriptor*> descriptor =
-      findDescriptor(vbmeta_data->get(), (*footer)->vbmeta_size);
-  if (!descriptor.Ok()) {
-    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
-        descriptor.ErrorMessage());
-  }
-
-  StatusOr<std::unique_ptr<AvbHashtreeDescriptor>> verifiedDescriptor =
-      verifyDescriptor(*descriptor);
-  if (!verifiedDescriptor.Ok()) {
-    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
-        verifiedDescriptor.ErrorMessage());
-  }
-  verityData->desc = std::move(*verifiedDescriptor);
-
-  // This area is now safe to access, because we just verified it
-  const uint8_t* trailingData =
-      (const uint8_t*)*descriptor + sizeof(AvbHashtreeDescriptor);
-  verityData->salt = getSalt(*(verityData->desc), trailingData);
-  verityData->root_digest = getDigest(*(verityData->desc), trailingData);
-
-  return StatusOr<std::unique_ptr<ApexVerityData>>(std::move(verityData));
-}
-
 StatusOr<std::vector<std::string>> getApexRootSubFolders() {
   // This code would be much shorter if C++17's std::filesystem were available,
   // which is not at the time of writing this.
@@ -731,7 +417,8 @@ Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
   }
   LOG(VERBOSE) << "Loopback device created: " << loopbackDevice.name;
 
-  auto verityData = verifyApexVerity(apex);
+  auto verityData = apex.VerifyApexVerity(
+      {kApexKeySystemDirectory, kApexKeyProductDirectory});
   if (!verityData.Ok()) {
     return Status(StringLog()
                   << "Failed to verify Apex Verity data for " << full_path
@@ -748,7 +435,7 @@ Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
       !android::base::StartsWith(full_path, kApexPackageSystemDir);
   DmVerityDevice verityDev;
   if (mountOnVerity) {
-    auto verityTable = createVerityTable(**verityData, loopbackDevice.name);
+    auto verityTable = createVerityTable(*verityData, loopbackDevice.name);
     StatusOr<DmVerityDevice> verityDevRes =
         createVerityDevice(packageId, *verityTable);
     if (!verityDevRes.Ok()) {
@@ -765,18 +452,27 @@ Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
     }
   }
 
-  if (mount(blockDevice.c_str(), mountPoint.c_str(), "ext4",
-            MS_NOATIME | MS_NODEV | MS_DIRSYNC | MS_RDONLY, NULL) == 0) {
-    LOG(INFO) << "Successfully mounted package " << full_path << " on "
-              << mountPoint;
+  for (size_t count = 0; count < kMountAttempts; ++count) {
+    if (mount(blockDevice.c_str(), mountPoint.c_str(), "ext4",
+              MS_NOATIME | MS_NODEV | MS_DIRSYNC | MS_RDONLY, NULL) == 0) {
+      LOG(INFO) << "Successfully mounted package " << full_path << " on "
+                << mountPoint;
 
-    // Time to accept the temporaries as good.
-    if (mountOnVerity) {
-      verityDev.Release();
+      // Time to accept the temporaries as good.
+      if (mountOnVerity) {
+        verityDev.Release();
+      }
+      loopbackDevice.CloseGood();
+
+      return Status::Success();
+    } else {
+      // TODO(b/122059364): Even though the kernel has created the verity
+      // device, we still depend on ueventd to run to actually create the
+      // device node in userspace. To solve this properly we should listen on
+      // the netlink socket for uevents, or use inotify. For now, this will
+      // have to do.
+      usleep(50000);
     }
-    loopbackDevice.CloseGood();
-
-    return Status::Success();
   }
   return Status::Fail(PStringLog()
                       << "Mounting failed for package " << full_path);
@@ -1118,24 +814,80 @@ void scanPackagesDirAndActivate(const char* apex_package_dir) {
   }
 }
 
-Status stagePackages(const std::vector<std::string>& tmp_paths) {
-  LOG(DEBUG) << "stagePackages() for " << android::base::Join(tmp_paths, ',');
+Status verifyPackages(const std::vector<std::string>& paths) {
+  LOG(DEBUG) << "verifyPackages() for " << android::base::Join(paths, ',');
 
-  if (tmp_paths.empty()) {
+  if (paths.empty()) {
     return Status::Fail("Empty set of inputs");
   }
 
   // Note: assume that sessions do not have thousands of paths, so that it is
   //       OK to keep the ApexFile/ApexManifests in memory.
 
-  // 1) Open all to check they can be opened and have valid manifests etc.
-  std::vector<ApexFile> apex_files;
-  for (const std::string& path : tmp_paths) {
-    StatusOr<ApexFile> apexFile = ApexFile::Open(path);
-    if (!apexFile.Ok()) {
-      return apexFile.ErrorStatus();
+  // Open all to check they can be opened and have valid manifests etc.
+  for (const std::string& path : paths) {
+    StatusOr<ApexFile> apex_file = ApexFile::Open(path);
+    if (!apex_file.Ok()) {
+      return apex_file.ErrorStatus();
     }
-    apex_files.emplace_back(std::move(*apexFile));
+    StatusOr<ApexVerityData> verity_or = apex_file->VerifyApexVerity(
+        {kApexKeySystemDirectory, kApexKeyProductDirectory});
+    if (!verity_or.Ok()) {
+      return verity_or.ErrorStatus();
+    }
+  }
+
+  return Status::Success();
+}
+
+Status preinstallPackages(const std::vector<std::string>& paths) {
+  LOG(DEBUG) << "preinstallPackages() for " << android::base::Join(paths, ',');
+
+  if (paths.empty()) {
+    return Status::Fail("Empty set of inputs");
+  }
+
+  // Note: assume that sessions do not have thousands of paths, so that it is
+  //       OK to keep the ApexFile/ApexManifests in memory.
+
+  // 1) Open all APEXes, check whether they have hooks.
+  bool has_pre_install_hooks = false;
+  std::vector<ApexFile> apex_files;
+  for (const std::string& path : paths) {
+    StatusOr<ApexFile> apex_file = ApexFile::Open(path);
+    if (!apex_file.Ok()) {
+      return apex_file.ErrorStatus();
+    }
+    if (!apex_file->GetManifest().GetPreInstallHook().empty()) {
+      has_pre_install_hooks = true;
+    }
+    apex_files.emplace_back(std::move(*apex_file));
+  }
+
+  // 2) If we found hooks, run pre-install.
+  if (has_pre_install_hooks) {
+    Status preinstall_status = StagePreInstall(apex_files);
+    if (!preinstall_status.Ok()) {
+      return preinstall_status;
+    }
+  }
+
+  return Status::Success();
+}
+
+Status stagePackages(const std::vector<std::string>& tmp_paths) {
+  LOG(DEBUG) << "stagePackages() for " << android::base::Join(tmp_paths, ',');
+
+  // Note: this function is temporary. As such the code is not optimized, e.g.,
+  //       it will open ApexFiles multiple times.
+
+  // 1) Verify all packages.
+  Status verify_status = verifyPackages(tmp_paths);
+  if (!verify_status.Ok()) {
+    return verify_status;
+  }
+  if (tmp_paths.empty()) {
+    return Status::Fail("Empty set of inputs");
   }
 
   // 2) Now stage all of them.
@@ -1147,57 +899,44 @@ Status stagePackages(const std::vector<std::string>& tmp_paths) {
   };
 
   // Ensure the APEX gets removed on failure.
-  std::vector<const ApexFile*> staged;
-  auto deleter = [&staged, &path_fn]() {
-    for (const ApexFile* apex_file : staged) {
-      if (TEMP_FAILURE_RETRY(unlink(path_fn(*apex_file).c_str())) != 0) {
-        PLOG(ERROR) << "Unable to unlink " << path_fn(*apex_file);
+  std::vector<std::string> staged;
+  auto deleter = [&staged]() {
+    for (const std::string& staged_path : staged) {
+      if (TEMP_FAILURE_RETRY(unlink(staged_path.c_str())) != 0) {
+        PLOG(ERROR) << "Unable to unlink " << staged_path;
       }
     }
   };
   auto scope_guard = android::base::make_scope_guard(deleter);
 
-  bool has_pre_install_hooks = false;
+  for (const std::string& path : tmp_paths) {
+    StatusOr<ApexFile> apex_file = ApexFile::Open(path);
+    if (!apex_file.Ok()) {
+      return apex_file.ErrorStatus();
+    }
+    std::string dest_path = path_fn(*apex_file);
 
-  for (const ApexFile& apex_file : apex_files) {
-    std::string dest_path = path_fn(apex_file);
-    if (rename(apex_file.GetPath().c_str(), dest_path.c_str()) != 0) {
+    if (rename(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
       // TODO: Get correct binder error status.
       return Status::Fail(PStringLog()
-                          << "Unable to rename " << apex_file.GetPath()
+                          << "Unable to rename " << apex_file->GetPath()
                           << " to " << dest_path);
     }
-    staged.push_back(&apex_file);
+    staged.push_back(dest_path);
 
     // TODO(b/112669193) remove this. Move the file from packageTmpPath to
     // destPath using file descriptor.
     if (selinux_android_restorecon(dest_path.c_str(), 0) < 0) {
       return Status::Fail(PStringLog() << "Failed to restorecon " << dest_path);
     }
-    LOG(DEBUG) << "Success renaming " << apex_file.GetPath() << " to "
+    LOG(DEBUG) << "Success renaming " << apex_file->GetPath() << " to "
                << dest_path;
-    if (!apex_file.GetManifest().GetPreInstallHook().empty()) {
-      has_pre_install_hooks = true;
-    }
   }
 
-  if (has_pre_install_hooks) {
-    // Need to recreate the APEX files, as they point to the tmp path.
-    std::vector<ApexFile> staged_apex_files;
-    staged_apex_files.reserve(apex_files.size());
-    for (const ApexFile& apex_file : apex_files) {
-      StatusOr<ApexFile> staged_apex_file = ApexFile::Open(path_fn(apex_file));
-      if (!staged_apex_file.Ok()) {
-        return Status::Fail(std::string("Failed reloading staged apex: ")
-                                .append(staged_apex_file.ErrorMessage()));
-      }
-      staged_apex_files.emplace_back(std::move(*staged_apex_file));
-    }
-
-    Status preinstall_status = StagePreInstall(staged_apex_files);
-    if (!preinstall_status.Ok()) {
-      return preinstall_status;
-    }
+  // 3) Run preinstall, if necessary.
+  Status preinstall_status = preinstallPackages(staged);
+  if (!preinstall_status.Ok()) {
+    return preinstall_status;
   }
 
   scope_guard.Disable();  // Accept the state.
