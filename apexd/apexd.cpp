@@ -59,6 +59,7 @@
 
 using android::base::EndsWith;
 using android::base::ReadFullyAtOffset;
+using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::dm::DeviceMapper;
@@ -826,13 +827,108 @@ void scanPackagesDirAndActivate(const char* apex_package_dir) {
   }
 }
 
-Status verifyPackages(const std::vector<std::string>& paths) {
+StatusOr<std::vector<ApexFile>> verifySessionDir(const int session_id) {
+  std::string sessionDirPath = std::string(kStagedSessionsDir) + "/session_" +
+                               std::to_string(session_id);
+  LOG(INFO) << "Scanning " << sessionDirPath
+            << " looking for packages to be validated";
+  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(sessionDirPath.c_str()),
+                                               closedir);
+
+  if (!d) {
+    PLOG(WARNING) << "Session directory " << sessionDirPath
+                  << " not found, nothing to do.";
+    return StatusOr<std::vector<ApexFile>>::MakeError(
+        "Cannot scan session directory.");
+  }
+  std::vector<std::string> pathsToVerify;
+  struct dirent* sessionDirP;
+  bool apexFileFound = false;
+  while ((sessionDirP = readdir(d.get())) != NULL) {
+    const std::string sessionFileName(sessionDirP->d_name);
+    if (sessionFileName == "." || sessionFileName == "..") {
+      continue;
+    }
+    // TODO(b/118865310): support sessions of sessions i.e. multi-package
+    // sessions.
+    const bool isApexFile =
+        sessionDirP->d_type == DT_REG &&
+        EndsWith(sessionFileName.c_str(), kApexPackageSuffix);
+    if (apexFileFound) {
+      return StatusOr<std::vector<ApexFile>>::MakeError(
+          "More than one APEX package found in the same session directory.");
+    }
+    apexFileFound = true;
+    if (isApexFile) {
+      pathsToVerify.push_back(android::base::StringPrintf(
+          "%s/%s", sessionDirPath.c_str(), sessionDirP->d_name));
+    }
+  }
+  return verifyPackages(pathsToVerify);
+}
+
+void scanStagedSessionsDirAndStage() {
+  LOG(INFO) << "Scanning " << kStagedSessionsDir
+            << " looking for sessions to be activated.";
+  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(kStagedSessionsDir),
+                                               closedir);
+
+  if (!d) {
+    PLOG(WARNING) << "Session directory " << kStagedSessionsDir
+                  << " not found, nothing to do.";
+    return;
+  }
+  struct dirent* dp;
+  while ((dp = readdir(d.get())) != NULL) {
+    const std::string name(dp->d_name);
+    if (name == "." || name == "..") {
+      continue;
+    }
+    const bool isSessionDir =
+        StartsWith(name, "session_") && (dp->d_type == DT_DIR);
+    if (isSessionDir) {
+      const std::string sessionDirPath =
+          android::base::StringPrintf("%s/%s", kStagedSessionsDir, dp->d_name);
+      auto sessionDir = std::unique_ptr<DIR, int (*)(DIR*)>(
+          opendir(sessionDirPath.c_str()), closedir);
+      struct dirent* sessionDirP;
+      while ((sessionDirP = readdir(sessionDir.get())) != NULL) {
+        const std::string sessionFileName(sessionDirP->d_name);
+        if (sessionFileName == "." || sessionFileName == "..") {
+          continue;
+        }
+        // TODO(b/118865310): support sessions of sessions i.e. multi-package
+        // sessions.
+        const bool isApexFile = sessionDirP->d_type == DT_REG &&
+                                EndsWith(sessionFileName, kApexPackageSuffix);
+        // TODO(b/118865310): double check that there is only one apex file per
+        // dir?
+        if (isApexFile) {
+          const std::string apexFilePath = android::base::StringPrintf(
+              "%s/%s/%s", kStagedSessionsDir, dp->d_name, sessionDirP->d_name);
+          const Status result =
+              stagePackages({apexFilePath}, /* linkPackages */ true);
+          if (!result.Ok()) {
+            LOG(ERROR) << "Activation failed for package " << apexFilePath
+                       << ": " << result.ErrorMessage();
+            // TODO(b/118865310): mark session as failed, rollback the changes
+            // and reboot the device
+          }
+        }
+      }
+    }
+  }
+  // TODO(b/118865310): mark session as successful
+}
+
+StatusOr<std::vector<ApexFile>> verifyPackages(
+    const std::vector<std::string>& paths) {
   LOG(DEBUG) << "verifyPackages() for " << android::base::Join(paths, ',');
 
   if (paths.empty()) {
-    return Status::Fail("Empty set of inputs");
+    return StatusOr<std::vector<ApexFile>>::MakeError("Empty set of inputs");
   }
-
+  std::vector<ApexFile> ret;
   // Note: assume that sessions do not have thousands of paths, so that it is
   //       OK to keep the ApexFile/ApexManifests in memory.
 
@@ -840,16 +936,19 @@ Status verifyPackages(const std::vector<std::string>& paths) {
   for (const std::string& path : paths) {
     StatusOr<ApexFile> apex_file = ApexFile::Open(path);
     if (!apex_file.Ok()) {
-      return apex_file.ErrorStatus();
+      return StatusOr<std::vector<ApexFile>>::MakeError(
+          apex_file.ErrorMessage());
     }
     StatusOr<ApexVerityData> verity_or = apex_file->VerifyApexVerity(
         {kApexKeySystemDirectory, kApexKeyProductDirectory});
     if (!verity_or.Ok()) {
-      return verity_or.ErrorStatus();
+      return StatusOr<std::vector<ApexFile>>::MakeError(
+          verity_or.ErrorMessage());
     }
+    ret.push_back(std::move(*apex_file));
   }
 
-  return Status::Success();
+  return StatusOr<std::vector<ApexFile>>(std::move(ret));
 }
 
 Status preinstallPackages(const std::vector<std::string>& paths) {
@@ -887,18 +986,19 @@ Status preinstallPackages(const std::vector<std::string>& paths) {
   return Status::Success();
 }
 
-Status stagePackages(const std::vector<std::string>& tmp_paths) {
-  LOG(DEBUG) << "stagePackages() for " << android::base::Join(tmp_paths, ',');
+Status stagePackages(const std::vector<std::string>& tmpPaths,
+                     bool linkPackages) {
+  LOG(DEBUG) << "stagePackages() for " << android::base::Join(tmpPaths, ',');
 
   // Note: this function is temporary. As such the code is not optimized, e.g.,
   //       it will open ApexFiles multiple times.
 
   // 1) Verify all packages.
-  Status verify_status = verifyPackages(tmp_paths);
+  auto verify_status = verifyPackages(tmpPaths);
   if (!verify_status.Ok()) {
-    return verify_status;
+    return Status::Fail(verify_status.ErrorMessage());
   }
-  if (tmp_paths.empty()) {
+  if (tmpPaths.empty()) {
     return Status::Fail("Empty set of inputs");
   }
 
@@ -921,27 +1021,39 @@ Status stagePackages(const std::vector<std::string>& tmp_paths) {
   };
   auto scope_guard = android::base::make_scope_guard(deleter);
 
-  for (const std::string& path : tmp_paths) {
+  for (const std::string& path : tmpPaths) {
     StatusOr<ApexFile> apex_file = ApexFile::Open(path);
     if (!apex_file.Ok()) {
       return apex_file.ErrorStatus();
     }
     std::string dest_path = path_fn(*apex_file);
 
-    if (rename(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
-      // TODO: Get correct binder error status.
-      return Status::Fail(PStringLog()
-                          << "Unable to rename " << apex_file->GetPath()
-                          << " to " << dest_path);
+    if (linkPackages) {
+      if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
+        // TODO: Get correct binder error status.
+        return Status::Fail(PStringLog()
+                            << "Unable to link " << apex_file->GetPath()
+                            << " to " << dest_path);
+      }
+    } else {
+      if (rename(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
+        // TODO: Get correct binder error status.
+        return Status::Fail(PStringLog()
+                            << "Unable to rename " << apex_file->GetPath()
+                            << " to " << dest_path);
+      }
     }
     staged.push_back(dest_path);
 
-    // TODO(b/112669193) remove this. Move the file from packageTmpPath to
-    // destPath using file descriptor.
-    if (selinux_android_restorecon(dest_path.c_str(), 0) < 0) {
-      return Status::Fail(PStringLog() << "Failed to restorecon " << dest_path);
+    if (!linkPackages) {
+      // TODO(b/112669193,b/118865310) remove this. Link files from staging
+      // directory should be the only method allowed.
+      if (selinux_android_restorecon(dest_path.c_str(), 0) < 0) {
+        return Status::Fail(PStringLog()
+                            << "Failed to restorecon " << dest_path);
+      }
     }
-    LOG(DEBUG) << "Success renaming " << apex_file->GetPath() << " to "
+    LOG(DEBUG) << "Success linking " << apex_file->GetPath() << " to "
                << dest_path;
   }
 
@@ -972,6 +1084,12 @@ void onAllPackagesReady() {
     PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
                 << kApexStatusReady;
   }
+}
+
+StatusOr<std::vector<ApexFile>> submitStagedSession(const int session_id) {
+  // TODO(b/118865310): upon successful verification, mark the session as
+  // staged in a checkpoint file.
+  return verifySessionDir(session_id);
 }
 
 }  // namespace apex
