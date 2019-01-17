@@ -184,7 +184,7 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   struct PrepareTestApexForInstall {
-    static constexpr const char* kTestDir = "/data/local/apexservice_tmp";
+    static constexpr const char* kTestDir = "/data/staging/apexservice_tmp";
 
     // This is given to the constructor.
     std::string test_input;  // Original test file.
@@ -400,7 +400,7 @@ TEST_F(ApexServiceTest, StageFailKey) {
 
   constexpr const char* kExpectedError3 =
       "Error verifying "
-      "/data/local/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
+      "/data/staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
       "couldn't verify public key: Failed to compare the bundled public key "
       "with key";
   const size_t pos3 = error.find(kExpectedError3);
@@ -597,80 +597,75 @@ TEST_F(ApexServiceActivationSuccessTest, GetActivePackage) {
   ASSERT_EQ(installer_->test_installed_file, active->packagePath);
 }
 
-TEST_F(ApexServiceTest, StagePreinstall) {
-  PrepareTestApexForInstall installer(
-      GetTestFile("apex.apexd_test_preinstall.apex"));
-  if (!installer.Prepare()) {
-    return;
-  }
+class ApexServicePrePostInstallTest : public ApexServiceTest {
+ public:
+  template <typename Fn>
+  void RunPrePost(Fn fn, const std::vector<std::string>& apex_names,
+                  const char* test_message) {
+    // Using unique_ptr is just the easiest here.
+    using InstallerUPtr = std::unique_ptr<PrepareTestApexForInstall>;
+    std::vector<InstallerUPtr> installers;
+    std::vector<std::string> pkgs;
 
-  bool success;
-  android::binder::Status st =
-      service_->stagePackage(installer.test_file, &success);
-  ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
-  ASSERT_TRUE(success);
+    for (const std::string& apex_name : apex_names) {
+      InstallerUPtr installer(
+          new PrepareTestApexForInstall(GetTestFile(apex_name)));
+      if (!installer->Prepare()) {
+        return;
+      }
+      pkgs.push_back(installer->test_file);
+      installers.emplace_back(std::move(installer));
+    }
+    android::binder::Status st = (service_.get()->*fn)(pkgs);
+    ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
 
-  std::string logcat = GetLogcat();
-  constexpr const char* kTestMessage = "sh      : PreInstall Test\n";
-  EXPECT_NE(std::string::npos, logcat.find(kTestMessage)) << logcat;
+    std::string logcat = GetLogcat();
+    EXPECT_NE(std::string::npos, logcat.find(test_message)) << logcat;
 
-  // Ensure that the package is neither active nor mounted.
-  {
-    StatusOr<bool> active = IsActive(installer.package, installer.version);
-    ASSERT_TRUE(active.Ok());
-    EXPECT_FALSE(*active);
+    // Ensure that the package is neither active nor mounted.
+    for (const InstallerUPtr& installer : installers) {
+      StatusOr<bool> active = IsActive(installer->package, installer->version);
+      ASSERT_TRUE(active.Ok());
+      EXPECT_FALSE(*active);
+    }
+    for (const InstallerUPtr& installer : installers) {
+      StatusOr<ApexFile> apex = ApexFile::Open(installer->test_input);
+      ASSERT_TRUE(apex.Ok());
+      std::string path =
+          apexd_private::GetPackageMountPoint(apex->GetManifest());
+      std::string entry = std::string("[dir]").append(path);
+      std::vector<std::string> slash_apex = ListDir(kApexRoot);
+      auto it = std::find(slash_apex.begin(), slash_apex.end(), entry);
+      EXPECT_TRUE(it == slash_apex.end()) << Join(slash_apex, ',');
+    }
   }
-  {
-    StatusOr<ApexFile> apex = ApexFile::Open(installer.test_input);
-    ASSERT_TRUE(apex.Ok());
-    std::string path = apexd_private::GetPackageMountPoint(apex->GetManifest());
-    std::string entry = std::string("[dir]").append(path);
-    std::vector<std::string> slash_apex = ListDir(kApexRoot);
-    auto it = std::find(slash_apex.begin(), slash_apex.end(), entry);
-    EXPECT_TRUE(it == slash_apex.end()) << Join(slash_apex, ',');
-  }
+};
+
+TEST_F(ApexServicePrePostInstallTest, Preinstall) {
+  RunPrePost(&IApexService::preinstallPackages,
+             {"apex.apexd_test_preinstall.apex"}, "sh      : PreInstall Test");
 }
 
-TEST_F(ApexServiceTest, MultiStagePreinstall) {
-  PrepareTestApexForInstall installer(
-      GetTestFile("apex.apexd_test_preinstall.apex"));
-  if (!installer.Prepare()) {
-    return;
-  }
-  PrepareTestApexForInstall installer2(GetTestFile("apex.apexd_test.apex"));
-  if (!installer2.Prepare()) {
-    return;
-  }
-
-  std::vector<std::string> pkgs = {
-      installer.test_file,
-      installer2.test_file,
-  };
-  bool success;
-  android::binder::Status st = service_->stagePackages(pkgs, &success);
-  ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
-  ASSERT_TRUE(success);
-
-  std::string logcat = GetLogcat();
-  constexpr const char* kTestMessage =
+TEST_F(ApexServicePrePostInstallTest, MultiPreinstall) {
+  constexpr const char* kLogcatText =
       "sh      : /apex/com.android.apex.test_package/etc/sample_prebuilt_file";
-  EXPECT_NE(std::string::npos, logcat.find(kTestMessage)) << logcat;
+  RunPrePost(&IApexService::preinstallPackages,
+             {"apex.apexd_test_preinstall.apex", "apex.apexd_test.apex"},
+             kLogcatText);
+}
 
-  // Ensure that the package is neither active nor mounted.
-  {
-    StatusOr<bool> active = IsActive(installer.package, installer.version);
-    ASSERT_TRUE(active.Ok());
-    EXPECT_FALSE(*active);
-  }
-  {
-    StatusOr<ApexFile> apex = ApexFile::Open(installer.test_input);
-    ASSERT_TRUE(apex.Ok());
-    std::string path = apexd_private::GetPackageMountPoint(apex->GetManifest());
-    std::string entry = std::string("[dir]").append(path);
-    std::vector<std::string> slash_apex = ListDir(kApexRoot);
-    auto it = std::find(slash_apex.begin(), slash_apex.end(), entry);
-    EXPECT_TRUE(it == slash_apex.end()) << Join(slash_apex, ',');
-  }
+TEST_F(ApexServicePrePostInstallTest, Postinstall) {
+  RunPrePost(&IApexService::postinstallPackages,
+             {"apex.apexd_test_postinstall.apex"},
+             "sh      : PostInstall Test");
+}
+
+TEST_F(ApexServicePrePostInstallTest, MultiPostinstall) {
+  constexpr const char* kLogcatText =
+      "sh      : /apex/com.android.apex.test_package/etc/sample_prebuilt_file";
+  RunPrePost(&IApexService::postinstallPackages,
+             {"apex.apexd_test_postinstall.apex", "apex.apexd_test.apex"},
+             kLogcatText);
 }
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {

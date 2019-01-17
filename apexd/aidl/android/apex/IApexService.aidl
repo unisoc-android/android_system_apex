@@ -43,4 +43,14 @@ interface IApexService {
     * functional on user builds.
     */
    void deactivatePackage(in @utf8InCpp String package_path);
+   /**
+    * Not meant for use outside of testing. The call will not be
+    * functional on user builds.
+    */
+   void preinstallPackages(in @utf8InCpp List<String> package_tmp_paths);
+   /**
+    * Not meant for use outside of testing. The call will not be
+    * functional on user builds.
+    */
+   void postinstallPackages(in @utf8InCpp List<String> package_tmp_paths);
 }
