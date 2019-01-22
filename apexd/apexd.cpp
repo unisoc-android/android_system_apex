@@ -25,6 +25,7 @@
 #include "apexd_loop.h"
 #include "apexd_prepostinstall.h"
 #include "apexd_session.h"
+#include "apexd_utils.h"
 #include "status_or.h"
 #include "string_log.h"
 
@@ -188,32 +189,6 @@ StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
   dev.SetDevPath(dev_path);
 
   return StatusOr<DmVerityDevice>(std::move(dev));
-}
-
-template <typename FilterFn>
-StatusOr<std::vector<std::string>> ReadDir(const std::string& path,
-                                           FilterFn fn) {
-  // This code would be much shorter if C++17's std::filesystem were available,
-  // which is not at the time of writing this.
-  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(path.c_str()), closedir);
-  if (!d) {
-    return StatusOr<std::vector<std::string>>::MakeError(
-        PStringLog() << "Can't open " << path << " for reading");
-  }
-
-  std::vector<std::string> ret;
-  struct dirent* dp;
-  while ((dp = readdir(d.get())) != NULL) {
-    if ((strcmp(dp->d_name, ".") == 0) || (strcmp(dp->d_name, "..") == 0)) {
-      continue;
-    }
-    if (!fn(dp->d_type, dp->d_name)) {
-      continue;
-    }
-    ret.push_back(path + "/" + dp->d_name);
-  }
-
-  return StatusOr<std::vector<std::string>>(std::move(ret));
 }
 
 template <char kTypeVal>
@@ -455,7 +430,7 @@ StatusOr<std::vector<ApexFile>> verifyPackages(
   return HandlePackages<StatusT>(paths, verify_fn);
 }
 
-StatusOr<std::vector<ApexFile>> verifySessionDir(const int session_id) {
+StatusOr<ApexFile> verifySessionDir(const int session_id) {
   std::string sessionDirPath = std::string(kStagedSessionsDir) + "/session_" +
                                std::to_string(session_id);
   LOG(INFO) << "Scanning " << sessionDirPath
@@ -464,17 +439,19 @@ StatusOr<std::vector<ApexFile>> verifySessionDir(const int session_id) {
       FindApexFilesByName(sessionDirPath, /* include_dirs=*/false);
   if (!scan.Ok()) {
     LOG(WARNING) << scan.ErrorMessage();
-    return StatusOr<std::vector<ApexFile>>::MakeError(scan.ErrorMessage());
+    return StatusOr<ApexFile>::MakeError(scan.ErrorMessage());
   }
 
-  // TODO(b/118865310): support sessions of sessions i.e. multi-package
-  // sessions.
   if (scan->size() > 1) {
-    return StatusOr<std::vector<ApexFile>>::MakeError(
+    return StatusOr<ApexFile>::MakeError(
         "More than one APEX package found in the same session directory.");
   }
 
-  return verifyPackages(*scan);
+  auto verified = verifyPackages(*scan);
+  if (!verified.Ok()) {
+    return StatusOr<ApexFile>::MakeError(verified.ErrorStatus());
+  }
+  return StatusOr<ApexFile>(std::move((*verified)[0]));
 }
 
 }  // namespace
@@ -750,93 +727,74 @@ void scanPackagesDirAndActivate(const char* apex_package_dir) {
   }
 }
 
-int getSessionIdFromSessionDir(const std::string& session_dir) {
-  int sessionId = -1;
-  // Find "session_"
-  auto foundSessionPos = session_dir.find("session_");
-  if (foundSessionPos == std::string::npos) {
-    return -1;
-  }
-  // Find following '/' (if any)
-  auto foundSlashPos = session_dir.find("/", foundSessionPos);
-  auto length = (foundSlashPos == std::string::npos)
-                    ? std::string::npos
-                    : foundSlashPos - foundSessionPos;
-
-  auto sessionString = session_dir.substr(foundSessionPos, length);
-  if (sessionString.empty()) {
-    return -1;
-  }
-  // Not using std::stoi because it throws exceptions when it can't match
-  int numFound = sscanf(sessionString.c_str(), "session_%d", &sessionId);
-  if (numFound == 1) {
-    return sessionId;
-  } else {
-    return -1;
-  }
-}
-
 void scanStagedSessionsDirAndStage() {
   LOG(INFO) << "Scanning " << kApexSessionsDir
             << " looking for sessions to be activated.";
 
-  StatusOr<std::vector<std::string>> sessions =
-      ReadDir(kApexSessionsDir, [](unsigned char d_type, const char* d_name) {
-        return (d_type == DT_DIR) && StartsWith(d_name, "session_");
-      });
-  if (!sessions.Ok()) {
-    LOG(WARNING) << sessions.ErrorMessage();
-    return;
-  }
-
-  for (const std::string sessionDirPath : *sessions) {
-    int sessionId = getSessionIdFromSessionDir(sessionDirPath);
-    if (sessionId == -1) {
-      LOG(ERROR) << "Could not parse session ID from path " << sessionDirPath;
-      continue;
-    }
-    auto res = readSessionState(sessionId);
-    if (!res.Ok()) {
-      LOG(WARNING) << "Ignoring session directory " << sessionDirPath
-                   << " because it doesn't have any state.";
-      continue;
-    }
-    auto sessionState = *res;
-    if (sessionState.state() != SessionState::STAGED) {
-      LOG(WARNING) << "Ignoring session directory " << sessionDirPath
-                   << " because its state is not staged.";
-      continue;
-    }
-    const std::string stageDirPath = std::string(kStagedSessionsDir) +
-                                     "/session_" + std::to_string(sessionId);
-    // TODO(b/118865310): support sessions of sessions i.e. multi-package
-    // sessions.
-    StatusOr<std::vector<std::string>> apexes =
-        FindApexFilesByName(stageDirPath, /* include_dirs=*/false);
-    if (!apexes.Ok()) {
-      LOG(WARNING) << apexes.ErrorMessage();
-      continue;
-    }
-    if (apexes->empty()) {
-      LOG(WARNING) << "Empty session " << sessionDirPath;
-      continue;
-    }
+  // TODO(b/118865310): Checkpoint the existing set of active packages in case
+  // we need to rollback the session.
+  // TODO(b/118865310) also get sessions in PENDING_RETRY state
+  auto stagedSessions = ApexSession::GetSessionsInState(SessionState::STAGED);
+  for (auto& session : stagedSessions) {
+    auto sessionId = session.GetId();
 
     auto session_failed_fn = [&]() {
-      // TODO(b/118865310): retry, and if it keeps fialing, rollback the changes
+      // TODO(b/118865310): retry, and if it keeps failing, rollback the changes
       // and reboot the device.
-      sessionState.set_state(SessionState::ACTIVATION_FAILED);
-      // TODO what if we fail to write the state?
-      writeSessionState(sessionId, sessionState);
+      LOG(WARNING) << "Marking session " << sessionId << " as failed.";
+      session.UpdateStateAndCommit(SessionState::ACTIVATION_FAILED);
     };
     auto scope_guard = android::base::make_scope_guard(session_failed_fn);
+
+    std::vector<std::string> dirsToScan;
+    if (session.GetChildSessionIds().empty()) {
+      dirsToScan.push_back(std::string(kStagedSessionsDir) + "/session_" +
+                           std::to_string(sessionId));
+    } else {
+      for (auto childSessionId : session.GetChildSessionIds()) {
+        dirsToScan.push_back(std::string(kStagedSessionsDir) + "/session_" +
+                             std::to_string(childSessionId));
+      }
+    }
+
+    std::vector<std::string> apexes;
+    bool scanSuccessful = true;
+    for (auto dirToScan : dirsToScan) {
+      StatusOr<std::vector<std::string>> scan =
+          FindApexFilesByName(dirToScan, /* include_dirs=*/false);
+      if (!scan.Ok()) {
+        LOG(WARNING) << scan.ErrorMessage();
+        scanSuccessful = false;
+        break;
+      }
+
+      if (scan->size() > 1) {
+        LOG(WARNING) << "More than one APEX package found in the same session "
+                     << "directory " << dirToScan << ", skipping activation.";
+        scanSuccessful = false;
+        break;
+      }
+
+      if (scan->empty()) {
+        LOG(WARNING) << "No APEX packages found while scanning " << dirToScan
+                     << " session id: " << sessionId << ".";
+        scanSuccessful = false;
+        break;
+      }
+      apexes.push_back(std::move((*scan)[0]));
+    }
+
+    if (!scanSuccessful) {
+      continue;
+    }
 
     // Run postinstall, if necessary.
     // TODO(b/118865310): this should be over the session of sessions,
     //                    including all packages.
-    Status postinstall_status = postinstallPackages(*apexes);
+    Status postinstall_status = postinstallPackages(apexes);
     if (!postinstall_status.Ok()) {
-      LOG(ERROR) << "Postinstall failed for session " << sessionDirPath << ": "
+      LOG(ERROR) << "Postinstall failed for session "
+                 << std::to_string(sessionId) << ": "
                  << postinstall_status.ErrorMessage();
       continue;
     }
@@ -844,9 +802,9 @@ void scanStagedSessionsDirAndStage() {
     // TODO(b/118865310): double check that there is only one apex file per
     // dir?
 
-    const Status result = stagePackages(*apexes, /* linkPackages */ true);
+    const Status result = stagePackages(apexes, /* linkPackages */ true);
     if (!result.Ok()) {
-      LOG(ERROR) << "Activation failed for packages " << Join(*apexes, ',')
+      LOG(ERROR) << "Activation failed for packages " << Join(apexes, ',')
                  << ": " << result.ErrorMessage();
       continue;
     }
@@ -854,9 +812,7 @@ void scanStagedSessionsDirAndStage() {
     // Session was OK, release scopeguard.
     scope_guard.Disable();
 
-    sessionState.set_state(SessionState::ACTIVATED);
-    // TODO what if we fail to write the state?
-    writeSessionState(sessionId, sessionState);
+    session.UpdateStateAndCommit(SessionState::ACTIVATED);
   }
 }
 
@@ -972,33 +928,39 @@ void onAllPackagesReady() {
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
+  std::vector<int> ids_to_scan;
   if (!child_session_ids.empty()) {
-    // TODO(b/118865310): support multi-package sessions.
-    return StatusOr<std::vector<ApexFile>>::MakeError(
-        "Multi-package sessions are not yet supported.");
+    ids_to_scan = child_session_ids;
+  } else {
+    ids_to_scan = {session_id};
   }
 
-  auto verified = verifySessionDir(session_id);
-  if (!verified.Ok()) {
-    return verified;
+  std::vector<ApexFile> ret;
+  for (int id_to_scan : ids_to_scan) {
+    auto verified = verifySessionDir(id_to_scan);
+    if (!verified.Ok()) {
+      return StatusOr<std::vector<ApexFile>>::MakeError(verified.ErrorStatus());
+    }
+    ret.push_back(std::move(*verified));
   }
 
   // Run preinstall, if necessary.
-  Status preinstall_status = PreinstallPackages(*verified);
+  Status preinstall_status = PreinstallPackages(ret);
   if (!preinstall_status.Ok()) {
     return StatusOr<std::vector<ApexFile>>::MakeError(preinstall_status);
   }
 
-  SessionState sessionState;
-  sessionState.set_state(SessionState::STAGED);
-  sessionState.set_retry_count(0);
-  auto stateWritten = writeSessionState(session_id, sessionState);
-  if (!stateWritten.Ok()) {
-    return StatusOr<std::vector<ApexFile>>::MakeError(
-        stateWritten.ErrorMessage());
+  auto session = ApexSession::CreateSession(session_id);
+  if (!session.Ok()) {
+    return StatusOr<std::vector<ApexFile>>::MakeError(session.ErrorMessage());
+  }
+  (*session).SetChildSessionIds(child_session_ids);
+  Status commit_status = (*session).UpdateStateAndCommit(SessionState::STAGED);
+  if (!commit_status.Ok()) {
+    return StatusOr<std::vector<ApexFile>>::MakeError(commit_status);
   }
 
-  return verified;
+  return StatusOr<std::vector<ApexFile>>(std::move(ret));
 }
 
 }  // namespace apex
