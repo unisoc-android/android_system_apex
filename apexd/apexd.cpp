@@ -24,6 +24,7 @@
 #include "apex_manifest.h"
 #include "apexd_loop.h"
 #include "apexd_prepostinstall.h"
+#include "apexd_prop.h"
 #include "apexd_session.h"
 #include "apexd_utils.h"
 #include "status_or.h"
@@ -133,14 +134,14 @@ class DmVerityDevice {
   DmVerityDevice(const std::string& name, const std::string& dev_path)
       : name_(name), dev_path_(dev_path), cleared_(false) {}
 
-  DmVerityDevice(DmVerityDevice&& other)
-      : name_(other.name_),
-        dev_path_(other.dev_path_),
+  DmVerityDevice(DmVerityDevice&& other) noexcept
+      : name_(std::move(other.name_)),
+        dev_path_(std::move(other.dev_path_)),
         cleared_(other.cleared_) {
     other.cleared_ = true;
   }
 
-  DmVerityDevice& operator=(DmVerityDevice&& other) {
+  DmVerityDevice& operator=(DmVerityDevice&& other) noexcept {
     name_ = other.name_;
     dev_path_ = other.dev_path_;
     cleared_ = other.cleared_;
@@ -595,6 +596,22 @@ std::string GetActiveMountPoint(const ApexManifest& manifest) {
 
 }  // namespace apexd_private
 
+void startBootSequence() {
+  unmountAndDetachExistingImages();
+  scanStagedSessionsDirAndStage();
+  // Scan the directory under /data first, as it may contain updates of APEX
+  // packages living in the directory under /system, and we want the former ones
+  // to be used over the latter ones.
+  scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
+  scanPackagesDirAndActivate(kApexPackageSystemDir);
+
+  // Notify other components (e.g. init) that all APEXs are correctly mounted
+  // and are ready to be used.
+  onAllPackagesReady();
+
+  waitForBootStatus(rollbackLastSession);
+}
+
 Status activatePackage(const std::string& full_path) {
   LOG(INFO) << "Trying to activate " << full_path;
 
@@ -798,7 +815,7 @@ void scanStagedSessionsDirAndStage() {
 
     std::vector<std::string> apexes;
     bool scanSuccessful = true;
-    for (auto dirToScan : dirsToScan) {
+    for (const auto& dirToScan : dirsToScan) {
       StatusOr<std::vector<std::string>> scan =
           FindApexFilesByName(dirToScan, /* include_dirs=*/false);
       if (!scan.Ok()) {
@@ -962,6 +979,20 @@ void onStart() {
   if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
     PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
                 << kApexStatusStarting;
+  }
+
+  // Scan /system/apex to get the number of (non-flattened) APEXes and
+  // pre-allocated loopback devices so that we don't have to wait for it
+  // later when actually activating APEXes.
+  StatusOr<std::vector<std::string>> scan =
+      FindApexFilesByName(kApexPackageSystemDir, false /*include_dirs*/);
+  if (!scan.Ok()) {
+    LOG(WARNING) << scan.ErrorMessage();
+  } else if (scan->size() > 0) {
+    Status preAllocStatus = loop::preAllocateLoopDevices(scan->size());
+    if (!preAllocStatus.Ok()) {
+      LOG(ERROR) << preAllocStatus.ErrorMessage();
+    }
   }
 }
 
