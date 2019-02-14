@@ -494,6 +494,33 @@ StatusOr<ApexFile> verifySessionDir(const int session_id) {
   return StatusOr<ApexFile>(std::move((*verified)[0]));
 }
 
+Status AbortNonFinalizedSessions() {
+  auto sessions = ApexSession::GetSessions();
+  int cnt = 0;
+  for (ApexSession& session : sessions) {
+    Status status;
+    switch (session.GetState()) {
+      case SessionState::VERIFIED:
+        [[clang::fallthrough]];
+      case SessionState::STAGED:
+        cnt++;
+        status = session.DeleteSession();
+        if (!status.Ok()) {
+          return Status::Fail(status.ErrorMessage());
+        }
+        if (cnt > 1) {
+          LOG(WARNING) << "More than one non-finalized session!";
+        }
+        break;
+      // TODO(b/124215327): fail if session is in ACTIVATED state.
+      default:
+        break;
+    }
+  }
+  LOG(DEBUG) << "Aborted " << cnt << " non-finalized sessions";
+  return Status::Success();
+}
+
 }  // namespace
 
 namespace apexd_private {
@@ -608,8 +635,6 @@ void startBootSequence() {
   // Notify other components (e.g. init) that all APEXs are correctly mounted
   // and are ready to be used.
   onAllPackagesReady();
-
-  waitForBootStatus(rollbackLastSession);
 }
 
 Status activatePackage(const std::string& full_path) {
@@ -853,7 +878,7 @@ void scanStagedSessionsDirAndStage() {
       continue;
     }
 
-    const Status result = stagePackages(apexes, /* linkPackages */ true);
+    const Status result = stagePackages(apexes);
     if (!result.Ok()) {
       LOG(ERROR) << "Activation failed for packages " << Join(apexes, ',')
                  << ": " << result.ErrorMessage();
@@ -883,8 +908,7 @@ Status postinstallPackages(const std::vector<std::string>& paths) {
   return HandlePackages<Status>(paths, PostinstallPackages);
 }
 
-Status stagePackages(const std::vector<std::string>& tmpPaths,
-                     bool linkPackages) {
+Status stagePackages(const std::vector<std::string>& tmpPaths) {
   if (tmpPaths.empty()) {
     return Status::Fail("Empty set of inputs");
   }
@@ -933,32 +957,15 @@ Status stagePackages(const std::vector<std::string>& tmpPaths,
     }
     std::string dest_path = path_fn(*apex_file);
 
-    if (linkPackages) {
-      if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
-        // TODO: Get correct binder error status.
-        return Status::Fail(PStringLog()
-                            << "Unable to link " << apex_file->GetPath()
-                            << " to " << dest_path);
-      }
-    } else {
-      if (rename(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
-        // TODO: Get correct binder error status.
-        return Status::Fail(PStringLog()
-                            << "Unable to rename " << apex_file->GetPath()
-                            << " to " << dest_path);
-      }
+    if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
+      // TODO: Get correct binder error status.
+      return Status::Fail(PStringLog()
+                          << "Unable to link " << apex_file->GetPath() << " to "
+                          << dest_path);
     }
     staged_files.insert(dest_path);
     staged_packages.insert(apex_file->GetManifest().name());
 
-    if (!linkPackages) {
-      // TODO(b/112669193,b/118865310) remove this. Link files from staging
-      // directory should be the only method allowed.
-      if (selinux_android_restorecon(dest_path.c_str(), 0) < 0) {
-        return Status::Fail(PStringLog()
-                            << "Failed to restorecon " << dest_path);
-      }
-    }
     LOG(DEBUG) << "Success linking " << apex_file->GetPath() << " to "
                << dest_path;
   }
@@ -1011,6 +1018,11 @@ void onAllPackagesReady() {
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
+  Status cleanup_status = AbortNonFinalizedSessions();
+  if (!cleanup_status.Ok()) {
+    return StatusOr<std::vector<ApexFile>>::MakeError(cleanup_status);
+  }
+
   std::vector<int> ids_to_scan;
   if (!child_session_ids.empty()) {
     ids_to_scan = child_session_ids;
