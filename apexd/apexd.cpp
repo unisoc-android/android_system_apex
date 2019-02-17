@@ -631,10 +631,6 @@ void startBootSequence() {
   // to be used over the latter ones.
   scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
   scanPackagesDirAndActivate(kApexPackageSystemDir);
-
-  // Notify other components (e.g. init) that all APEXs are correctly mounted
-  // and are ready to be used.
-  onAllPackagesReady();
 }
 
 Status activatePackage(const std::string& full_path) {
@@ -749,6 +745,30 @@ StatusOr<ApexFile> getActivePackage(const std::string& packageName) {
 
   return StatusOr<ApexFile>::MakeError(
       PStringLog() << "Cannot find matching package for: " << packageName);
+}
+
+Status abortActiveSession() {
+  auto session_or_none = ApexSession::GetActiveSession();
+  if (!session_or_none.Ok()) {
+    return session_or_none.ErrorStatus();
+  }
+  if (session_or_none->has_value()) {
+    const auto& session = session_or_none->value();
+    LOG(DEBUG) << "Aborting active session " << session;
+    switch (session.GetState()) {
+      case SessionState::VERIFIED:
+        [[clang::fallthrough]];
+      case SessionState::STAGED:
+        return session.DeleteSession();
+      // TODO(b/123622800): if state is ACTIVATED do a rollback.
+      default:
+        return Status::Fail(StringLog()
+                            << "Session " << session << " can't be aborted");
+    }
+  } else {
+    LOG(DEBUG) << "There are no active sessions";
+    return Status::Success();
+  }
 }
 
 void unmountAndDetachExistingImages() {
@@ -957,6 +977,12 @@ Status stagePackages(const std::vector<std::string>& tmpPaths) {
     }
     std::string dest_path = path_fn(*apex_file);
 
+    if (access(dest_path.c_str(), F_OK) == 0) {
+      LOG(DEBUG) << dest_path << " already exists. Unlinking it";
+      if (unlink(dest_path.c_str()) != 0) {
+        return Status::Fail(PStringLog() << "Failed to unlink " << dest_path);
+      }
+    }
     if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
       // TODO: Get correct binder error status.
       return Status::Fail(PStringLog()
@@ -1076,6 +1102,26 @@ Status markStagedSessionReady(const int session_id) {
   }
   return Status::Fail(StringLog() << "Invalid state for session " << session_id
                                   << ". Cannot mark it as ready.");
+}
+
+Status markStagedSessionSuccessful(const int session_id) {
+  auto session = ApexSession::GetSession(session_id);
+  if (!session.Ok()) {
+    return session.ErrorStatus();
+  }
+  // Only SessionState::ACTIVATED or SessionState::SUCCESS states are accepted.
+  // In the SessionState::SUCCESS state, this function is a no-op.
+  switch (session->GetState()) {
+    case SessionState::SUCCESS:
+      return Status::Success();
+    case SessionState::ACTIVATED:
+      // TODO(b/123622800): also cleanup a backup.
+      // TODO(b/124215327): maybe crash system_server if state update fails.
+      return session->UpdateStateAndCommit(SessionState::SUCCESS);
+    default:
+      return Status::Fail(StringLog() << "Session " << *session
+                                      << " can not be marked successful");
+  }
 }
 
 }  // namespace apex
