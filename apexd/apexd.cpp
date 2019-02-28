@@ -684,6 +684,25 @@ Status RollbackSession(ApexSession& session) {
   return Status::Success();
 }
 
+Status ResumeRollback(ApexSession& session) {
+  auto backup_exists = PathExists(std::string(kApexBackupDir));
+  if (!backup_exists.Ok()) {
+    return backup_exists.ErrorStatus();
+  }
+  if (*backup_exists) {
+    auto rollback_status = DoRollback();
+    if (!rollback_status.Ok()) {
+      return rollback_status;
+    }
+  }
+  auto status = session.UpdateStateAndCommit(SessionState::ROLLED_BACK);
+  if (!status.Ok()) {
+    LOG(WARNING) << "Failed to mark session " << session
+                 << " as rolled back : " << status.ErrorMessage();
+  }
+  return Status::Success();
+}
+
 }  // namespace
 
 namespace apexd_private {
@@ -786,15 +805,52 @@ std::string GetActiveMountPoint(const ApexManifest& manifest) {
 
 }  // namespace apexd_private
 
+Status resumeRollbackIfNeeded() {
+  auto session = ApexSession::GetActiveSession();
+  if (!session.Ok()) {
+    return session.ErrorStatus();
+  }
+  if (!session->has_value()) {
+    return Status::Success();
+  }
+  if ((**session).GetState() == SessionState::ROLLBACK_IN_PROGRESS) {
+    // This means that phone was rebooted during the rollback. Resuming it.
+    return ResumeRollback(**session);
+  }
+  return Status::Success();
+}
+
 void startBootSequence() {
   unmountAndDetachExistingImages();
   scanStagedSessionsDirAndStage();
+  Status status = resumeRollbackIfNeeded();
+  if (!status.Ok()) {
+    LOG(ERROR) << "Failed to resume rollback : " << status.ErrorMessage();
+  }
   // Scan the directory under /data first, as it may contain updates of APEX
   // packages living in the directory under /system, and we want the former ones
   // to be used over the latter ones.
-  scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
+  status = scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
+  if (!status.Ok()) {
+    LOG(ERROR) << "Failed to activate packages from "
+               << kActiveApexPackagesDataDir << " : " << status.ErrorMessage();
+    Status rollback_status = rollbackLastSession();
+    if (rollback_status.Ok()) {
+      LOG(ERROR) << "Successfully rolled back. Time to reboot device.";
+      Reboot();
+    } else {
+      // TODO: should we kill apexd in this case?
+      LOG(ERROR) << "Failed to rollback : " << rollback_status.ErrorMessage();
+    }
+  }
   // TODO(b/123622800): if activation failed, rollback and reboot.
-  scanPackagesDirAndActivate(kApexPackageSystemDir);
+  status = scanPackagesDirAndActivate(kApexPackageSystemDir);
+  if (!status.Ok()) {
+    // This should never happen. Like **really** never.
+    // TODO: should we kill apexd in this case?
+    LOG(ERROR) << "Failed to activate packages from " << kApexPackageSystemDir
+               << " : " << status.ErrorMessage();
+  }
 }
 
 Status activatePackage(const std::string& full_path) {
@@ -1157,10 +1213,8 @@ Status stagePackages(const std::vector<std::string>& tmpPaths) {
     std::string dest_path = path_fn(*apex_file);
 
     if (access(dest_path.c_str(), F_OK) == 0) {
-      LOG(DEBUG) << dest_path << " already exists. Unlinking it";
-      if (unlink(dest_path.c_str()) != 0) {
-        return Status::Fail(PStringLog() << "Failed to unlink " << dest_path);
-      }
+      LOG(DEBUG) << dest_path << " already exists. Skipping";
+      continue;
     }
     if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
       // TODO: Get correct binder error status.
