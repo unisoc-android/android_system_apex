@@ -80,6 +80,9 @@ def ParseArgs(argv):
                       help='type of APEX payload being built "zip" or "image"')
   parser.add_argument('--override_apk_package_name', required=False,
                       help='package name of the APK container. Default is the apex name in --manifest.')
+  parser.add_argument('--android_jar_path', required=False,
+                      default="prebuilts/sdk/current/public/android.jar",
+                      help='path to use as the source of the android API.')
   return parser.parse_args(argv)
 
 def FindBinaryPath(binary):
@@ -127,14 +130,12 @@ def RoundUp(size, unit):
   return (size + unit - 1) & (~(unit - 1))
 
 def PrepareAndroidManifest(package, version):
-  # TODO(b/122578966) Specify min/max API level for APEX.
   template = """\
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="{package}" android:versionCode="{version}">
   <!-- APEX does not have classes.dex -->
   <application android:hasCode="false" />
-  <uses-sdk android:minSdkVersion="Q" android:targetSdkVersion="Q" />
 </manifest>
 """
   return template.format(package=package, version=version)
@@ -363,7 +364,7 @@ def CreateApex(args, work_dir):
   # specified in AndroidManifest.xml
   cmd.extend(['--version-code', str(manifest_apex.version)])
   cmd.extend(['-o', apk_file])
-  cmd.extend(['-I', "prebuilts/sdk/current/public/android.jar"])
+  cmd.extend(['-I', args.android_jar_path])
   RunCommand(cmd, args.verbose)
 
   zip_file = os.path.join(work_dir, 'apex.zip')
