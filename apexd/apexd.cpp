@@ -22,6 +22,7 @@
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_manifest.h"
+#include "apex_shim.h"
 #include "apexd_loop.h"
 #include "apexd_prepostinstall.h"
 #include "apexd_prop.h"
@@ -87,6 +88,8 @@ static constexpr const char* kApexKeySystemDirectory =
     "/system/etc/security/apex/";
 static constexpr const char* kApexKeyProductDirectory =
     "/product/etc/security/apex/";
+static constexpr const char* kApexKeySystemProductDirectory =
+    "/system/product/etc/security/apex/";
 
 // These should be in-sync with system/sepolicy/public/property_contexts
 static constexpr const char* kApexStatusSysprop = "apexd.status";
@@ -276,8 +279,9 @@ Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
   }
   LOG(VERBOSE) << "Loopback device created: " << loopbackDevice.name;
 
-  auto verityData = apex.VerifyApexVerity(
-      {kApexKeySystemDirectory, kApexKeyProductDirectory});
+  auto verityData =
+      apex.VerifyApexVerity({kApexKeySystemDirectory, kApexKeyProductDirectory,
+                             kApexKeySystemProductDirectory});
   if (!verityData.Ok()) {
     return Status(StringLog()
                   << "Failed to verify Apex Verity data for " << full_path
@@ -468,6 +472,18 @@ RetType HandlePackages(const std::vector<std::string>& paths, Fn fn) {
   return fn(apex_files);
 }
 
+Status ValidateStagingShimApex(const ApexFile& to) {
+  const std::string& package_name = to.GetManifest().name();
+  auto from = getActivePackage(package_name);
+  if (!from.Ok()) {
+    return Status::Fail(StringLog()
+                        << "Can't load active version of " << package_name
+                        << " : " << from.ErrorMessage());
+  }
+  auto validate_status = shim::ValidateShimApex(to);
+  return shim::ValidateUpdate(*from, to);
+}
+
 StatusOr<std::vector<ApexFile>> verifyPackages(
     const std::vector<std::string>& paths) {
   if (paths.empty()) {
@@ -479,9 +495,16 @@ StatusOr<std::vector<ApexFile>> verifyPackages(
   auto verify_fn = [](std::vector<ApexFile>& apexes) {
     for (const ApexFile& apex_file : apexes) {
       StatusOr<ApexVerityData> verity_or = apex_file.VerifyApexVerity(
-          {kApexKeySystemDirectory, kApexKeyProductDirectory});
+          {kApexKeySystemDirectory, kApexKeyProductDirectory,
+           kApexKeySystemProductDirectory});
       if (!verity_or.Ok()) {
         return StatusT::MakeError(verity_or.ErrorMessage());
+      }
+      if (shim::IsShimApex(apex_file)) {
+        auto validate_status = ValidateStagingShimApex(apex_file);
+        if (!validate_status.Ok()) {
+          return StatusT::MakeError(validate_status);
+        }
       }
     }
     return StatusT(std::move(apexes));
@@ -843,6 +866,14 @@ Status activatePackage(const std::string& full_path) {
   if (!apexFile.Ok()) {
     return apexFile.ErrorStatus();
   }
+
+  if (shim::IsShimApex(*apexFile)) {
+    auto validate_status = shim::ValidateShimApex(*apexFile);
+    if (!validate_status.Ok()) {
+      return validate_status;
+    }
+  }
+
   const ApexManifest& manifest = apexFile->GetManifest();
 
   if (gBootstrap && std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
