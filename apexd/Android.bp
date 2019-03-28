@@ -1,3 +1,13 @@
+tidy_errors = [
+  "performance-faster-string-find",
+  "performance-for-range-copy",
+  "performance-implicit-conversion-in-loop",
+  "performance-move-const-arg",
+  "performance-move-constructor-init",
+  "performance-noexcept-move-constructor",
+  "performance-unnecessary-value-param",
+]
+
 cc_defaults {
   name: "apex_flags_defaults",
   cflags: [
@@ -20,6 +30,8 @@ cc_defaults {
     "-Wused-but-marked-unused",
   ],
   tidy: true,
+  tidy_checks: tidy_errors,
+  tidy_checks_as_errors: tidy_errors,
   tidy_flags: [
     "-format-style='file'",
     "--header-filter='system/apex/'",
@@ -261,8 +273,9 @@ cc_test {
     ":apex.apexd_test_postinstall",
     ":apex.apexd_test_prepostinstall.fail",
     ":gen_bad_apexes",
-    ":com.android.apex.cts.shim.v2",
     ":com.android.apex.cts.shim.v1",
+    ":com.android.apex.cts.shim.v2",
+    ":com.android.apex.cts.shim.v2_wrong_sha",
   ],
   srcs: ["apexservice_test.cpp"],
   host_supported: false,
@@ -272,6 +285,7 @@ cc_test {
     "libapex",
     "libapexd",
     "libavb",
+    "libdm",
     "libgmock",
     "libvold_binder",
   ],
@@ -284,17 +298,3 @@ cc_test {
   test_config: "apexservice_test_config.xml",
 }
 
-cc_test {
-  name: "apex_shim_test",
-  defaults: ["apex_defaults"],
-  data: [":apex.apexd_test"],
-  srcs: ["apex_shim_test.cpp"],
-  host_supported: true,
-  target: {
-    darwin: {
-      enabled: false,
-    },
-  },
-  static_libs: ["libapex"],
-  test_suites: ["device-tests"],
-}

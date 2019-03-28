@@ -39,6 +39,7 @@
 #include <binder/IServiceManager.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <libdm/dm.h>
 #include <selinux/selinux.h>
 
 #include <android/apex/ApexInfo.h>
@@ -67,6 +68,9 @@ using android::apex::testing::IsOk;
 using android::apex::testing::SessionInfoEq;
 using android::base::Join;
 using android::base::StringPrintf;
+using ::testing::EndsWith;
+using ::testing::HasSubstr;
+using ::testing::Not;
 using ::testing::UnorderedElementsAre;
 using ::testing::UnorderedElementsAreArray;
 
@@ -472,6 +476,48 @@ TEST_F(ApexServiceTest, StageSuccess) {
   EXPECT_TRUE(RegularFileExists(installer.test_installed_file));
 }
 
+TEST_F(ApexServiceTest, StageSuccessDoesNotLeakTempVerityDevices) {
+  using android::dm::DeviceMapper;
+
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  bool success;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &success)));
+  ASSERT_TRUE(success);
+
+  std::vector<DeviceMapper::DmBlockDevice> devices;
+  DeviceMapper& dm = DeviceMapper::Instance();
+  ASSERT_TRUE(dm.GetAvailableDevices(&devices));
+
+  for (const auto& device : devices) {
+    ASSERT_THAT(device.name(), Not(EndsWith(".tmp")));
+  }
+}
+
+TEST_F(ApexServiceTest, StageFailDoesNotLeakTempVerityDevices) {
+  using android::dm::DeviceMapper;
+
+  PrepareTestApexForInstall installer(
+      GetTestFile("apex.apexd_test_manifest_mismatch.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  bool success;
+  ASSERT_FALSE(IsOk(service_->stagePackage(installer.test_file, &success)));
+
+  std::vector<DeviceMapper::DmBlockDevice> devices;
+  DeviceMapper& dm = DeviceMapper::Instance();
+  ASSERT_TRUE(dm.GetAvailableDevices(&devices));
+
+  for (const auto& device : devices) {
+    ASSERT_THAT(device.name(), Not(EndsWith(".tmp")));
+  }
+}
+
 TEST_F(ApexServiceTest, StageSuccess_ClearsPreviouslyActivePackage) {
   PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test_v2.apex"));
   PrepareTestApexForInstall installer2(
@@ -542,6 +588,11 @@ TEST_F(ApexServiceTest, MultiStageSuccess) {
 template <typename NameProvider>
 class ApexServiceActivationTest : public ApexServiceTest {
  public:
+  ApexServiceActivationTest() : stage_package(true) {}
+
+  ApexServiceActivationTest(bool stage_package)
+      : stage_package(stage_package) {}
+
   void SetUp() override {
     ApexServiceTest::SetUp();
     ASSERT_NE(nullptr, service_.get());
@@ -561,7 +612,7 @@ class ApexServiceActivationTest : public ApexServiceTest {
       ASSERT_FALSE(*active);
     }
 
-    {
+    if (stage_package) {
       bool success;
       ASSERT_TRUE(
           IsOk(service_->stagePackage(installer_->test_file, &success)));
@@ -572,7 +623,11 @@ class ApexServiceActivationTest : public ApexServiceTest {
   void TearDown() override {
     // Attempt to deactivate.
     if (installer_ != nullptr) {
-      service_->deactivatePackage(installer_->test_installed_file);
+      if (stage_package) {
+        service_->deactivatePackage(installer_->test_installed_file);
+      } else {
+        service_->deactivatePackage(installer_->test_file);
+      }
     }
 
     installer_.reset();
@@ -583,6 +638,9 @@ class ApexServiceActivationTest : public ApexServiceTest {
   }
 
   std::unique_ptr<PrepareTestApexForInstall> installer_;
+
+ private:
+  bool stage_package;
 };
 
 struct SuccessNameProvider {
@@ -602,22 +660,22 @@ struct ManifestMismatchNameProvider {
 };
 
 class ApexServiceActivationManifestMismatchFailure
-    : public ApexServiceActivationTest<ManifestMismatchNameProvider> {};
+    : public ApexServiceActivationTest<ManifestMismatchNameProvider> {
+ public:
+  ApexServiceActivationManifestMismatchFailure()
+      : ApexServiceActivationTest(false) {}
+};
 
 TEST_F(ApexServiceActivationManifestMismatchFailure,
        ActivateFailsWithManifestMismatch) {
-  android::binder::Status st =
-      service_->activatePackage(installer_->test_installed_file);
+  android::binder::Status st = service_->activatePackage(installer_->test_file);
   ASSERT_FALSE(IsOk(st));
 
   std::string error = st.toString8().c_str();
-
-  constexpr const char* kExpectedError =
-      "Failed to verify apex manifest for "
-      "/data/apex/active/com.android.apex.test_package@137.apex: "
-      "Manifest inside filesystem does not match manifest outside it";
-
-  EXPECT_TRUE(error.find(kExpectedError) != std::string::npos) << error;
+  ASSERT_THAT(
+      error,
+      HasSubstr(
+          "Manifest inside filesystem does not match manifest outside it"));
 }
 
 class ApexServiceActivationSuccessTest
@@ -718,6 +776,62 @@ TEST_F(ApexServiceActivationSuccessTest, StageAlreadyActivePackageSameVersion) {
   bool success = false;
   ASSERT_TRUE(IsOk(service_->stagePackage(installer_->test_file, &success)));
   ASSERT_TRUE(success);
+}
+
+class ApexServiceDeactivationTest : public ApexServiceActivationSuccessTest {
+ public:
+  void SetUp() override {
+    ApexServiceActivationSuccessTest::SetUp();
+
+    ASSERT_TRUE(installer_ != nullptr);
+  }
+
+  void TearDown() override {
+    installer_.reset();
+    ApexServiceActivationSuccessTest::TearDown();
+  }
+
+  std::unique_ptr<PrepareTestApexForInstall> installer_;
+};
+
+TEST_F(ApexServiceActivationSuccessTest, DmDeviceTearDown) {
+  std::string package_id =
+      installer_->package + "@" + std::to_string(installer_->version);
+
+  auto find_fn = [](const std::string& name) {
+    auto& dm = dm::DeviceMapper::Instance();
+    std::vector<dm::DeviceMapper::DmBlockDevice> devices;
+    if (!dm.GetAvailableDevices(&devices)) {
+      return StatusOr<bool>::Fail("GetAvailableDevices failed");
+    }
+    for (const auto& device : devices) {
+      if (device.name() == name) {
+        return StatusOr<bool>(true);
+      }
+    }
+    return StatusOr<bool>(false);
+  };
+
+#define ASSERT_FIND(type)                     \
+  {                                           \
+    StatusOr<bool> res = find_fn(package_id); \
+    ASSERT_TRUE(res.Ok());                    \
+    ASSERT_##type(*res);                      \
+  }
+
+  ASSERT_FIND(FALSE);
+
+  ASSERT_TRUE(IsOk(service_->activatePackage(installer_->test_installed_file)))
+      << GetDebugStr(installer_.get());
+
+  ASSERT_FIND(TRUE);
+
+  ASSERT_TRUE(
+      IsOk(service_->deactivatePackage(installer_->test_installed_file)));
+
+  ASSERT_FIND(FALSE);
+
+  installer_.reset();  // Skip TearDown deactivatePackage.
 }
 
 class ApexServicePrePostInstallTest : public ApexServiceTest {
@@ -1701,6 +1815,18 @@ TEST_F(ApexShimUpdateTest, UpdateToV2Success) {
   bool success;
   ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &success)));
   ASSERT_TRUE(success);
+}
+
+TEST_F(ApexShimUpdateTest, UpdateToV2FailureWrongSHA512) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.v2_wrong_sha.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  bool success;
+  ASSERT_FALSE(IsOk(service_->stagePackage(installer.test_file, &success)));
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
