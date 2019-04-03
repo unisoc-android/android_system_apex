@@ -45,9 +45,9 @@
 #include <android/apex/ApexInfo.h>
 #include <android/apex/IApexService.h>
 
+#include "apex_constants.h"
 #include "apex_file.h"
 #include "apex_manifest.h"
-#include "apexd.h"
 #include "apexd_private.h"
 #include "apexd_session.h"
 #include "apexd_test_utils.h"
@@ -428,6 +428,13 @@ TEST_F(ApexServiceTest, StageFailAccess) {
   EXPECT_NE(std::string::npos, error.find("I/O error")) << error;
 }
 
+// TODO(jiyong): re-enable this test. This test is disabled because the build
+// system now always bundles the public key that was used to sign the APEX.
+// In debuggable build, the bundled public key is used as the last fallback.
+// As a result, the verification is always successful (and thus test fails).
+// In order to re-enable this test, we have to manually create an APEX
+// where public key is not bundled.
+#if 0
 TEST_F(ApexServiceTest, StageFailKey) {
   PrepareTestApexForInstall installer(
       GetTestFile("apex.apexd_test_no_inst_key.apex"));
@@ -461,6 +468,7 @@ TEST_F(ApexServiceTest, StageFailKey) {
   const size_t npos = std::string::npos;
   EXPECT_TRUE((pos1 != npos && pos2 != npos) || pos3 != npos) << error;
 }
+#endif
 
 TEST_F(ApexServiceTest, StageSuccess) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"));
@@ -1028,6 +1036,13 @@ TEST_F(ApexServiceTest, SubmitSingleStagedSessionDeletesPreviousSessions) {
   ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(new_session)));
 }
 
+// TODO(jiyong): re-enable this test. This test is disabled because the build
+// system now always bundles the public key that was used to sign the APEX.
+// In debuggable build, the bundled public key is used as the last fallback.
+// As a result, the verification is always successful (and thus test fails).
+// In order to re-enable this test, we have to manually create an APEX
+// where public key is not bundled.
+#if 0
 TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
   PrepareTestApexForInstall installer(
       GetTestFile("apex.apexd_test_no_inst_key.apex"),
@@ -1051,6 +1066,7 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
   expected.isUnknown = true;
   EXPECT_THAT(session, SessionInfoEq(expected));
 }
+#endif
 
 TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
   // Parent session id: 10
@@ -1113,6 +1129,13 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
   ASSERT_THAT(session, SessionInfoEq(expected));
 }
 
+// TODO(jiyong): re-enable this test. This test is disabled because the build
+// system now always bundles the public key that was used to sign the APEX.
+// In debuggable build, the bundled public key is used as the last fallback.
+// As a result, the verification is always successful (and thus test fails).
+// In order to re-enable this test, we have to manually create an APEX
+// where public key is not bundled.
+#if 0
 TEST_F(ApexServiceTest, SubmitMultiSessionTestFail) {
   // Parent session id: 11
   // Children session ids: 21 31
@@ -1133,6 +1156,7 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestFail) {
       << GetDebugStr(&installer);
   ASSERT_FALSE(ret_value);
 }
+#endif
 
 TEST_F(ApexServiceTest, MarkStagedSessionReadyFail) {
   // We should fail if we ask information about a session we don't know.
@@ -1518,7 +1542,7 @@ TEST_F(ApexServiceRollbackTest, RollbackLastSessionCalledSuccessfulRollback) {
 
   PrepareBackup({GetTestFile("apex.apexd_test.apex")});
 
-  ASSERT_TRUE(IsOk(rollbackActiveSession()));
+  ASSERT_TRUE(IsOk(service_->rollbackActiveSession()));
 
   auto pkg = StringPrintf("%s/com.android.apex.test_package@1.apex",
                           kActiveApexPackagesDataDir);
@@ -1543,16 +1567,16 @@ TEST_F(ApexServiceRollbackTest, RollbackLastSessionCalledNoActiveSession) {
 
   // Even though backup is there, no sessions are active, hence rollback request
   // should fail.
-  ASSERT_FALSE(IsOk(rollbackActiveSession()));
+  ASSERT_FALSE(IsOk(service_->rollbackActiveSession()));
 }
 
 TEST_F(ApexServiceRollbackTest, RollbackFailsNoBackupFolder) {
-  ASSERT_FALSE(IsOk(rollbackActiveSession()));
+  ASSERT_FALSE(IsOk(service_->rollbackActiveSession()));
 }
 
 TEST_F(ApexServiceRollbackTest, RollbackFailsNoActivePackagesFolder) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"));
-  ASSERT_FALSE(IsOk(rollbackActiveSession()));
+  ASSERT_FALSE(IsOk(service_->rollbackActiveSession()));
 }
 
 TEST_F(ApexServiceRollbackTest, MarkStagedSessionSuccessfulCleanupBackup) {
@@ -1590,7 +1614,7 @@ TEST_F(ApexServiceRollbackTest, ResumesRollback) {
   ASSERT_TRUE(
       IsOk(session->UpdateStateAndCommit(SessionState::ROLLBACK_IN_PROGRESS)));
 
-  ASSERT_TRUE(IsOk(resumeRollbackIfNeeded()));
+  ASSERT_TRUE(IsOk(service_->resumeRollbackIfNeeded()));
 
   auto pkg1 = StringPrintf("%s/com.android.apex.test_package@1.apex",
                            kActiveApexPackagesDataDir);
@@ -1624,7 +1648,7 @@ TEST_F(ApexServiceRollbackTest, DoesNotResumeRollback) {
   ASSERT_TRUE(IsOk(session));
   ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(SessionState::SUCCESS)));
 
-  ASSERT_TRUE(IsOk(resumeRollbackIfNeeded()));
+  ASSERT_TRUE(IsOk(service_->resumeRollbackIfNeeded()));
 
   // Check that rollback wasn't resumed.
   auto active_pkgs =

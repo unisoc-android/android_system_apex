@@ -95,6 +95,7 @@ cc_binary {
   static_libs: [
     "libapex",
     "libapexd",
+    "libapexd_checkpoint_vold",
     "libapexservice",
     "libavb",
     "libdm",
@@ -130,10 +131,21 @@ cc_library_static {
     "libapex",
     "libavb",
     "libdm",
-    "libvold_binder",
   ],
   shared_libs: [
     "libselinux",
+  ],
+  export_include_dirs: ["."],
+}
+
+cc_library_static {
+  name: "libapexd_checkpoint_vold",
+  defaults: ["apex_defaults"],
+  srcs: [ "apexd_checkpoint_vold.cpp" ],
+  static_libs: [
+    "libbase",
+    "libutils",
+    "libvold_binder",
   ],
   export_include_dirs: ["."],
 }
@@ -161,6 +173,7 @@ cc_library_static {
   defaults: ["apex_defaults"],
   srcs: [
     "apex_file.cpp",
+    "apex_key.cpp",
     "apex_manifest.cpp",
     "apex_shim.cpp",
   ],
@@ -204,6 +217,7 @@ cc_test {
   data: [
     ":apex.apexd_test",
     ":apex.apexd_test_no_inst_key",
+    "apexd_testdata/com.android.apex.test_package.avbpubkey",
   ],
   srcs: [
     "apex_file_test.cpp",

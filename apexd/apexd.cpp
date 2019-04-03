@@ -21,8 +21,10 @@
 
 #include "apex_database.h"
 #include "apex_file.h"
+#include "apex_key.h"
 #include "apex_manifest.h"
 #include "apex_shim.h"
+#include "apexd_checkpoint.h"
 #include "apexd_loop.h"
 #include "apexd_prepostinstall.h"
 #include "apexd_prop.h"
@@ -39,8 +41,6 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
-#include <android/os/IVold.h>
-#include <binder/IServiceManager.h>
 #include <libavb/libavb.h>
 #include <libdm/dm.h>
 #include <libdm/dm_table.h>
@@ -68,7 +68,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-using android::sp;
 using android::base::EndsWith;
 using android::base::Join;
 using android::base::ReadFullyAtOffset;
@@ -79,7 +78,6 @@ using android::dm::DeviceMapper;
 using android::dm::DmDeviceState;
 using android::dm::DmTable;
 using android::dm::DmTargetVerity;
-using android::os::IVold;
 
 using apex::proto::SessionState;
 
@@ -89,14 +87,6 @@ namespace apex {
 using MountedApexData = MountedApexDatabase::MountedApexData;
 
 namespace {
-
-static constexpr const char* kApexPackageSuffix = ".apex";
-static constexpr const char* kApexKeySystemDirectory =
-    "/system/etc/security/apex/";
-static constexpr const char* kApexKeyProductDirectory =
-    "/product/etc/security/apex/";
-static constexpr const char* kApexKeySystemProductDirectory =
-    "/system/product/etc/security/apex/";
 
 // These should be in-sync with system/sepolicy/public/property_contexts
 static constexpr const char* kApexStatusSysprop = "apexd.status";
@@ -109,7 +99,8 @@ static bool gForceDmVerityOnSystem =
     android::base::GetBoolProperty(kApexVerityOnSystemProp, false);
 
 MountedApexDatabase gMountedApexes;
-sp<IVold> gVoldService;
+
+CheckpointInterface* gVoldService;
 bool gSupportsFsCheckpoints = false;
 bool gInFsCheckpointMode = false;
 
@@ -121,11 +112,6 @@ static const std::vector<const std::string> kBootstrapApexes = {
     "com.android.runtime",
     "com.android.tzdata",
 };
-
-bool isPathForBuiltinApexes(const std::string& path) {
-  return StartsWith(path, kApexPackageSystemDir) ||
-         StartsWith(path, kApexPackageProductDir);
-}
 
 std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
                                            const std::string& loop) {
@@ -222,21 +208,6 @@ bool DTypeFilter(unsigned char d_type, const char* d_name ATTRIBUTE_UNUSED) {
   return d_type == kTypeVal;
 }
 
-StatusOr<std::vector<std::string>> FindApexFilesByName(const std::string& path,
-                                                       bool include_dirs) {
-  auto filter_fn =
-      [include_dirs](const std::filesystem::directory_entry& entry) {
-        std::error_code ec;
-        if (entry.is_regular_file(ec) &&
-            EndsWith(entry.path().filename().string(), kApexPackageSuffix)) {
-          return true;  // APEX file, take.
-        }
-        // Directory and asked to scan for flattened.
-        return entry.is_directory(ec) && include_dirs;
-      };
-  return ReadDir(path, filter_fn);
-}
-
 Status RemovePreviouslyActiveApexFiles(
     const std::unordered_set<std::string>& affected_packages,
     const std::unordered_set<std::string>& files_to_keep) {
@@ -309,9 +280,7 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
   }
   LOG(VERBOSE) << "Loopback device created: " << loopbackDevice.name;
 
-  auto verityData =
-      apex.VerifyApexVerity({kApexKeySystemDirectory, kApexKeyProductDirectory,
-                             kApexKeySystemProductDirectory});
+  auto verityData = apex.VerifyApexVerity();
   if (!verityData.Ok()) {
     return StatusM::Fail(StringLog()
                          << "Failed to verify Apex Verity data for "
@@ -562,9 +531,7 @@ Status verifyPackage(const ApexFile& apex_file) {
   if (apex_file.IsFlattened()) {
     return Status::Fail("Can't upgrade flattened apex");
   }
-  StatusOr<ApexVerityData> verity_or = apex_file.VerifyApexVerity(
-      {kApexKeySystemDirectory, kApexKeyProductDirectory,
-       kApexKeySystemProductDirectory});
+  StatusOr<ApexVerityData> verity_or = apex_file.VerifyApexVerity();
   if (!verity_or.Ok()) {
     return Status::Fail(verity_or.ErrorMessage());
   }
@@ -1474,9 +1441,11 @@ Status rollbackActiveSessionAndReboot() {
   }
   LOG(ERROR) << "Successfully rolled back. Time to reboot device.";
   if (gInFsCheckpointMode) {
-    gVoldService->abortChanges("apexd_initiated" /* message */,
-                               false /* retry */);
-    // This should have rebooted the device, but fall through in case it failed.
+    Status res = gVoldService->AbortChanges("apexd_initiated" /* message */,
+                                            false /* retry */);
+    if (!res.Ok()) {
+      LOG(ERROR) << res.ErrorMessage();
+    }
   }
   Reboot();
   return Status::Success();
@@ -1499,51 +1468,55 @@ int onBootstrap() {
     }
   }
 
+  Status status = collectApexKeys();
+  if (!status.Ok()) {
+    LOG(ERROR) << "Failed to collect APEX keys : " << status.ErrorMessage();
+    return 1;
+  }
+
   // Activate built-in APEXes for processes launched before /data is mounted.
   scanPackagesDirAndActivate(kApexPackageSystemDir);
   LOG(INFO) << "Bootstrapping done";
   return 0;
 }
 
-void onStart() {
+void onStart(CheckpointInterface* checkpoint_service) {
   LOG(INFO) << "Marking APEXd as starting";
   if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
     PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
                 << kApexStatusStarting;
   }
 
-  auto voldService =
-      defaultServiceManager()->getService(android::String16("vold"));
-  if (voldService != nullptr) {
-    gVoldService = android::interface_cast<android::os::IVold>(voldService);
-    android::binder::Status status =
-        gVoldService->supportsCheckpoint(&gSupportsFsCheckpoints);
-    if (!status.isOk()) {
+  if (checkpoint_service != nullptr) {
+    gVoldService = checkpoint_service;
+    StatusOr<bool> supports_fs_checkpoints =
+        gVoldService->SupportsFsCheckpoints();
+    if (supports_fs_checkpoints.Ok()) {
+      gSupportsFsCheckpoints = *supports_fs_checkpoints;
+    } else {
       LOG(ERROR) << "Failed to check if filesystem checkpoints are supported: "
-                 << status.toString8().c_str();
+                 << supports_fs_checkpoints.ErrorMessage();
     }
     if (gSupportsFsCheckpoints) {
-      status = gVoldService->needsCheckpoint(&gInFsCheckpointMode);
-      if (!status.isOk()) {
+      StatusOr<bool> needs_checkpoint = gVoldService->NeedsCheckpoint();
+      if (needs_checkpoint.Ok()) {
+        gInFsCheckpointMode = *needs_checkpoint;
+      } else {
         LOG(ERROR) << "Failed to check if we're in filesystem checkpoint mode: "
-                   << status.toString8().c_str();
+                   << needs_checkpoint.ErrorMessage();
       }
     }
-  } else {
-    LOG(ERROR) << "Failed to retrieve vold service.";
   }
 
   // Ask whether we should roll back any staged sessions; this can happen if
   // we've exceeded the retry count on a device that supports filesystem
   // checkpointing.
   if (gSupportsFsCheckpoints) {
-    bool needsRollback = false;
-    auto binderStatus = gVoldService->needsRollback(&needsRollback);
-    if (!binderStatus.isOk()) {
+    StatusOr<bool> needs_rollback = gVoldService->NeedsRollback();
+    if (!needs_rollback.Ok()) {
       LOG(ERROR) << "Failed to check if we need a rollback: "
-                 << binderStatus.toString8().c_str();
-    }
-    if (needsRollback) {
+                 << needs_rollback.ErrorMessage();
+    } else if (*needs_rollback) {
       Status status = rollbackStagedSessionIfAny();
       if (!status.Ok()) {
         LOG(ERROR)
@@ -1553,10 +1526,16 @@ void onStart() {
     }
   }
 
+  Status status = collectApexKeys();
+  if (!status.Ok()) {
+    LOG(ERROR) << "Failed to collect APEX keys : " << status.ErrorMessage();
+    return;
+  }
+
   // Activate APEXes from /data/apex. If one in the directory is newer than the
   // system one, the new one will eclipse the old one.
   scanStagedSessionsDirAndStage();
-  Status status = resumeRollbackIfNeeded();
+  status = resumeRollbackIfNeeded();
   if (!status.Ok()) {
     LOG(ERROR) << "Failed to resume rollback : " << status.ErrorMessage();
   }
