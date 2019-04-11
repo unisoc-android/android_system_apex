@@ -33,6 +33,7 @@
 #include "status_or.h"
 #include "string_log.h"
 
+#include <ApexProperties.sysprop.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/macros.h>
@@ -830,11 +831,20 @@ Status BackupActivePackages() {
   return Status::Success();
 }
 
-Status DoRollback() {
+Status DoRollback(ApexSession& session) {
   if (gInFsCheckpointMode) {
     // We will roll back automatically when we reboot
     return Status::Success();
   }
+  auto scope_guard = android::base::make_scope_guard([&]() {
+    auto st = session.UpdateStateAndCommit(SessionState::ROLLBACK_FAILED);
+    LOG(DEBUG) << "Marking " << session << " as failed to rollback";
+    if (!st.Ok()) {
+      LOG(WARNING) << "Failed to mark session " << session
+                   << " as failed to rollback : " << st.ErrorMessage();
+    }
+  });
+
   auto backup_exists = PathExists(std::string(kApexBackupDir));
   if (!backup_exists.Ok()) {
     return backup_exists.ErrorStatus();
@@ -872,6 +882,7 @@ Status DoRollback() {
                         << kActiveApexPackagesDataDir);
   }
 
+  scope_guard.Disable();  // Rollback succeeded. Accept state.
   return Status::Success();
 }
 
@@ -883,6 +894,7 @@ Status RollbackStagedSession(ApexSession& session) {
 
 Status RollbackActivatedSession(ApexSession& session) {
   if (gInFsCheckpointMode) {
+    LOG(DEBUG) << "Checkpoint mode is enabled";
     // On checkpointing devices, our modifications on /data will be
     // automatically rolled back when we abort changes. Updating the session
     // state is pointless here, as it will be rolled back as well.
@@ -897,7 +909,7 @@ Status RollbackActivatedSession(ApexSession& session) {
                                     << " failed : " << status.ErrorMessage());
   }
 
-  status = DoRollback();
+  status = DoRollback(session);
   if (!status.Ok()) {
     return Status::Fail(StringLog() << "Rollback of session " << session
                                     << " failed : " << status.ErrorMessage());
@@ -936,7 +948,7 @@ Status ResumeRollback(ApexSession& session) {
     return backup_exists.ErrorStatus();
   }
   if (*backup_exists) {
-    auto rollback_status = DoRollback();
+    auto rollback_status = DoRollback(session);
     if (!rollback_status.Ok()) {
       return rollback_status;
     }
@@ -1047,12 +1059,23 @@ Status resumeRollbackIfNeeded() {
   return Status::Success();
 }
 
+static bool IsApexUpdatable() {
+  static bool updatable =
+      android::sysprop::ApexProperties::updatable().value_or(false);
+  return updatable;
+}
+
 Status activatePackageImpl(const ApexFile& apex_file) {
   const ApexManifest& manifest = apex_file.GetManifest();
 
   if (gBootstrap && std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
                               manifest.name()) == kBootstrapApexes.end()) {
     LOG(INFO) << "Skipped when bootstrapping";
+    return Status::Success();
+  } else if (!IsApexUpdatable() && !gBootstrap &&
+             std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
+                       manifest.name()) != kBootstrapApexes.end()) {
+    LOG(INFO) << "Package already activated in bootstrap";
     return Status::Success();
   }
 
@@ -1172,6 +1195,40 @@ std::unordered_map<std::string, uint64_t> GetActivePackagesMap() {
 }
 
 }  // namespace
+
+std::vector<ApexFile> getFactoryPackages() {
+  std::vector<ApexFile> ret;
+  auto all_system_factory_apex_files =
+      FindApexFilesByName(kApexPackageSystemDir, /* include_dirs=*/false);
+  if (!all_system_factory_apex_files.Ok()) {
+    LOG(ERROR) << all_system_factory_apex_files.ErrorMessage();
+    return ret;
+  }
+  for (const std::string& path : *all_system_factory_apex_files) {
+    StatusOr<ApexFile> apex_file = ApexFile::Open(path);
+    if (!apex_file.Ok()) {
+      LOG(ERROR) << apex_file.ErrorMessage();
+    } else {
+      ret.emplace_back(std::move(*apex_file));
+    }
+  }
+
+  auto all_product_factory_apex_files =
+      FindApexFilesByName(kApexPackageProductDir, /* include_dirs=*/false);
+  if (!all_product_factory_apex_files.Ok()) {
+    LOG(INFO) << all_product_factory_apex_files.ErrorMessage();
+  } else {
+    for (const std::string& path : *all_product_factory_apex_files) {
+      StatusOr<ApexFile> apex_file = ApexFile::Open(path);
+      if (!apex_file.Ok()) {
+        LOG(ERROR) << apex_file.ErrorMessage();
+      } else {
+        ret.emplace_back(std::move(*apex_file));
+      }
+    }
+  }
+  return ret;
+}
 
 StatusOr<ApexFile> getActivePackage(const std::string& packageName) {
   std::vector<ApexFile> packages = getActivePackages();
@@ -1554,8 +1611,8 @@ Status rollbackStagedSessionIfAny() {
 Status rollbackActiveSession() {
   auto session = ApexSession::GetActiveSession();
   if (!session.Ok()) {
-    LOG(ERROR) << "Failed to get active session : " << session.ErrorMessage();
-    return DoRollback();
+    return Status::Fail(StringLog() << "Failed to get active session : "
+                                    << session.ErrorMessage());
   } else if (!session->has_value()) {
     return Status::Fail(
         "Rollback requested, when there are no active sessions.");
