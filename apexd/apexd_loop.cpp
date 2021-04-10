@@ -53,7 +53,7 @@ static constexpr const char* kReadAheadKb = "128";
 // device node in userspace. To solve this properly we should listen on
 // the netlink socket for uevents, or use inotify. For now, this will
 // have to do.
-static constexpr size_t kLoopDeviceRetryAttempts = 3u;
+static constexpr size_t kLoopDeviceRetryAttempts = 2400u;
 
 void LoopbackDeviceUniqueFd::MaybeCloseBad() {
   if (device_fd.get() != -1) {
